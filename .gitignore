@@ -205,3 +205,12 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+*.pdf
+*.md
+markdown/
+dataset/
+.github/
+.vscode/
+checkpoints/
+logs/
