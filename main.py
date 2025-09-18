@@ -94,7 +94,7 @@ Examples:
     parser.add_argument(
         "--preset", 
         type=str, 
-        choices=["nuner_baseline", "fast_debug", "small_gpu", "io_scheme"],
+        choices=["nuner_baseline", "fast_debug", "small_gpu"],
         default="nuner_baseline",
         help="Use predefined configuration preset"
     )
@@ -134,12 +134,6 @@ Examples:
         "--no_crf", 
         action="store_true",
         help="Disable CRF layer"
-    )
-    parser.add_argument(
-        "--tagging_scheme", 
-        type=str, 
-        choices=["BIO", "IO"],
-        help="Tagging scheme to use"
     )
     parser.add_argument(
         "--frozen_layers", 
@@ -268,8 +262,7 @@ def create_config_from_args(args: argparse.Namespace) -> ERAConfig:
         preset_map = {
             "nuner_baseline": ERAConfigPresets.nuner_baseline,
             "fast_debug": ERAConfigPresets.fast_debug,
-            "small_gpu": ERAConfigPresets.small_gpu,
-            "io_scheme": ERAConfigPresets.io_scheme
+            "small_gpu": ERAConfigPresets.small_gpu
         }
         config = preset_map[args.preset]()
         logger.info(f"Using preset configuration: {args.preset}")
@@ -290,8 +283,6 @@ def create_config_from_args(args: argparse.Namespace) -> ERAConfig:
         override_dict["use_crf"] = True
     if args.no_crf:
         override_dict["use_crf"] = False
-    if args.tagging_scheme:
-        override_dict["tagging_scheme"] = args.tagging_scheme
     if args.frozen_layers is not None:
         override_dict["frozen_layers"] = args.frozen_layers
     
@@ -364,13 +355,7 @@ def setup_data_processor(config: ERAConfig, args: argparse.Namespace) -> Empathy
         llm_model_path = config.llm_model_path
     elif args.models_dir:
         # Try to find ChatGLM model in models directory
-        models_dir = Path(args.models_dir)
-        for model_name in ["chatglm4", "chatglm3"]:
-            model_path = models_dir / model_name
-            if model_path.exists():
-                llm_model_path = str(model_path)
-                logger.info(f"Found LLM model: {llm_model_path}")
-                break
+        llm_model_path = "zai-org/chatglm-6b"
     
     # Clear cache if requested
     if args.force_reprocess:
@@ -386,7 +371,6 @@ def setup_data_processor(config: ERAConfig, args: argparse.Namespace) -> Empathy
         llm_model_path=llm_model_path,
         tokenizer_model=config.bert_model,
         max_length=config.max_length,
-        tagging_scheme=config.tagging_scheme,
         cache_dir=config.cache_dir
     )
     

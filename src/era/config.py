@@ -3,7 +3,7 @@ Configuration System for ERA
 
 Defines hyperparameters from NuNER specifications:
 - Frozen layers=6, lr=3e-5, batch_size=48, dropout=0.1, etc.
-- Supports both BIO and IO tagging schemes
+- Uses IO tagging scheme only: {O: 0, EM: 1}
 - Configurable for different model architectures
 """
 
@@ -25,8 +25,7 @@ class ERAConfig:
     
     # ==================== Model Configuration ====================
     bert_model: str = "roberta-base"  # Base model architecture
-    num_labels: int = 3  # For BIO: O, B-EM, I-EM (or 2 for IO: O, EM)
-    tagging_scheme: str = "BIO"  # "BIO" or "IO"
+    num_labels: int = 2  # IO scheme: O, EM
     max_length: int = 512  # Maximum sequence length
     
     # ==================== Training Configuration (NuNER) ====================
@@ -139,12 +138,7 @@ class ERAConfig:
     def __post_init__(self):
         """Post-initialization processing."""
         # Adjust num_labels based on tagging scheme
-        if self.tagging_scheme.upper() == "BIO":
-            self.num_labels = 3  # O, B-EM, I-EM
-        elif self.tagging_scheme.upper() == "IO":
-            self.num_labels = 2  # O, EM
-        else:
-            raise ValueError(f"Unsupported tagging scheme: {self.tagging_scheme}")
+        self.num_labels = 2  # O, EM
         
         # Ensure output directories exist
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
@@ -228,7 +222,6 @@ class ERAConfig:
         return {
             "bert_model": self.bert_model,
             "num_labels": self.num_labels,
-            "tagging_scheme": self.tagging_scheme,
             "max_length": self.max_length,
             "hidden_size": self.hidden_size,
             "use_crf": self.use_crf,
@@ -271,7 +264,6 @@ class ERAConfig:
             "valid_ratio": self.valid_ratio,
             "test_ratio": self.test_ratio,
             "max_length": self.max_length,
-            "tagging_scheme": self.tagging_scheme,
             "oversampling_ratio": self.oversampling_ratio
         }
     
@@ -312,7 +304,6 @@ class ERAConfigPresets:
         """
         return ERAConfig(
             bert_model="roberta-base",
-            tagging_scheme="BIO",
             frozen_layers=6,
             learning_rate=3e-5,
             encoder_lr=3e-5,
@@ -357,19 +348,6 @@ class ERAConfigPresets:
         config.fp16 = True
         config.dataloader_num_workers = 2
         config.max_length = 256  # Shorter sequences
-        return config
-    
-    @staticmethod
-    def io_scheme() -> ERAConfig:
-        """
-        Configuration using IO tagging scheme instead of BIO.
-        
-        Returns:
-            ERAConfig with IO tagging
-        """
-        config = ERAConfig()
-        config.tagging_scheme = "IO"
-        config.num_labels = 2
         return config
 
 

@@ -2,10 +2,10 @@
 ERA Evaluator Module
 
 Implements comprehensive evaluation metrics:
-- Token-level and entity-level F1/Precision/Recall
+- Token-level F1/Precision/Recall for IO scheme
 - Confusion matrix and classification report
 - Error analysis functionality
-- Support for both BIO and IO tagging schemes
+- Support for IO tagging scheme: {O: 0, EM: 1}
 - Detailed performance breakdown by label types
 
 Based on NuNER evaluation practices and EAR.md specifications.
@@ -45,11 +45,6 @@ class EvaluationResults:
     token_recall: float = 0.0
     token_f1: float = 0.0
     
-    # Entity-level metrics (for BIO scheme)
-    entity_precision: float = 0.0
-    entity_recall: float = 0.0
-    entity_f1: float = 0.0
-    
     # Class-specific metrics
     class_metrics: Dict[str, Dict[str, float]] = None
     
@@ -66,9 +61,6 @@ class EvaluationResults:
             "token_precision": self.token_precision,
             "token_recall": self.token_recall,
             "token_f1": self.token_f1,
-            "entity_precision": self.entity_precision,
-            "entity_recall": self.entity_recall,
-            "entity_f1": self.entity_f1,
         }
         
         # Add class-specific metrics
@@ -85,8 +77,7 @@ class ERAEvaluator:
     Comprehensive evaluator for ERA model performance.
     
     Supports:
-    - Token-level evaluation (standard NER metrics)
-    - Entity-level evaluation (for BIO scheme)
+    - Token-level evaluation for IO scheme
     - Confusion matrix and classification reports
     - Error analysis and detailed breakdowns
     - Both macro and micro averaging
@@ -103,19 +94,15 @@ class ERAEvaluator:
         
         Args:
             config: ERA configuration object
-            label_names: List of label names (e.g., ["O", "B-EM", "I-EM"])
+            label_names: List of label names (e.g., ["O", "EM"])
             ignore_index: Index to ignore in evaluation
         """
         self.config = config
-        self.tagging_scheme = getattr(config, 'tagging_scheme', 'BIO')
         self.ignore_index = ignore_index
         
         # Set up label names
         if label_names is None:
-            if self.tagging_scheme.upper() == "BIO":
-                self.label_names = ["O", "B-EM", "I-EM"]
-            else:  # IO
-                self.label_names = ["O", "EM"]
+            self.label_names = ["O", "EM"]
         else:
             self.label_names = label_names
         
@@ -124,7 +111,6 @@ class ERAEvaluator:
         self.label_to_id = {label: i for i, label in enumerate(self.label_names)}
         
         logger.info(f"ERAEvaluator initialized:")
-        logger.info(f"  Tagging scheme: {self.tagging_scheme}")
         logger.info(f"  Labels: {self.label_names}")
         logger.info(f"  Ignore index: {self.ignore_index}")
     
@@ -157,11 +143,6 @@ class ERAEvaluator:
         # Compute token-level metrics
         token_metrics = self._compute_token_metrics(flat_predictions, flat_labels)
         
-        # Compute entity-level metrics (for BIO scheme)
-        entity_metrics = {}
-        if self.tagging_scheme.upper() == "BIO":
-            entity_metrics = self._compute_entity_metrics(predictions, labels)
-        
         # Compute class-specific metrics
         class_metrics = self._compute_class_metrics(flat_predictions, flat_labels)
         
@@ -174,7 +155,6 @@ class ERAEvaluator:
         # Combine all metrics
         all_metrics = {
             **token_metrics,
-            **entity_metrics,
             **{f"class_{k}": v for k, v in class_metrics.items()},
             "num_samples": len(flat_predictions),
             "num_classes": len(self.label_names)
@@ -186,9 +166,6 @@ class ERAEvaluator:
             token_precision=token_metrics.get("precision", 0.0),
             token_recall=token_metrics.get("recall", 0.0),
             token_f1=token_metrics.get("f1", 0.0),
-            entity_precision=entity_metrics.get("entity_precision", 0.0),
-            entity_recall=entity_metrics.get("entity_recall", 0.0),
-            entity_f1=entity_metrics.get("entity_f1", 0.0),
             class_metrics=class_metrics,
             confusion_matrix=conf_matrix,
             error_analysis=error_analysis
@@ -278,99 +255,6 @@ class ERAEvaluator:
             "micro_recall": micro_recall,
             "micro_f1": micro_f1
         }
-    
-    def _compute_entity_metrics(
-        self, 
-        predictions: np.ndarray, 
-        labels: np.ndarray
-    ) -> Dict[str, float]:
-        """
-        Compute entity-level metrics for BIO tagging scheme.
-        
-        Args:
-            predictions: Prediction array [batch_size, seq_len]
-            labels: Label array [batch_size, seq_len]
-            
-        Returns:
-            Dictionary with entity-level metrics
-        """
-        if self.tagging_scheme.upper() != "BIO":
-            return {}
-        
-        total_predicted_entities = 0
-        total_gold_entities = 0
-        total_correct_entities = 0
-        
-        for pred_seq, label_seq in zip(predictions, labels):
-            # Extract entities from sequences
-            pred_entities = self._extract_entities_bio(pred_seq)
-            gold_entities = self._extract_entities_bio(label_seq)
-            
-            # Count entities
-            total_predicted_entities += len(pred_entities)
-            total_gold_entities += len(gold_entities)
-            
-            # Count correct entities (exact match)
-            correct_entities = pred_entities & gold_entities
-            total_correct_entities += len(correct_entities)
-        
-        # Compute metrics
-        precision = total_correct_entities / total_predicted_entities if total_predicted_entities > 0 else 0.0
-        recall = total_correct_entities / total_gold_entities if total_gold_entities > 0 else 0.0
-        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-        
-        return {
-            "entity_precision": precision,
-            "entity_recall": recall,
-            "entity_f1": f1,
-            "total_predicted_entities": total_predicted_entities,
-            "total_gold_entities": total_gold_entities,
-            "total_correct_entities": total_correct_entities
-        }
-    
-    def _extract_entities_bio(self, sequence: np.ndarray) -> Set[Tuple[int, int]]:
-        """
-        Extract entities from BIO-tagged sequence.
-        
-        Args:
-            sequence: BIO-tagged sequence
-            
-        Returns:
-            Set of (start, end) entity spans
-        """
-        entities = set()
-        current_start = None
-        
-        for i, label_id in enumerate(sequence):
-            if label_id == self.ignore_index:
-                continue
-            
-            label = self.id_to_label.get(label_id, "O")
-            
-            if label.startswith("B-"):
-                # Start of new entity
-                if current_start is not None:
-                    # End previous entity
-                    entities.add((current_start, i - 1))
-                current_start = i
-                
-            elif label.startswith("I-"):
-                # Continue current entity
-                if current_start is None:
-                    # Invalid I- without B-, treat as beginning
-                    current_start = i
-                    
-            else:  # O tag
-                # End current entity
-                if current_start is not None:
-                    entities.add((current_start, i - 1))
-                    current_start = None
-        
-        # Handle entity at end of sequence
-        if current_start is not None:
-            entities.add((current_start, len(sequence) - 1))
-        
-        return entities
     
     def _compute_class_metrics(
         self, 

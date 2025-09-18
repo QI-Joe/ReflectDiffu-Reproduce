@@ -4,6 +4,7 @@ Data Processor for ERA System
 Handles EmpatheticDialogues loading, ChatGLM4 annotation, 
 token-label alignment, and train/valid/test splitting (8:1:1).
 
+Uses IO tagging scheme: {O: 0, EM: 1}
 Based on specifications in EAR.md.
 """
 
@@ -24,6 +25,7 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModel
 
 logger = logging.getLogger(__name__)
+os.environ["HL_ENDPOINT"] = "https://hf-mirror.com"
 
 @dataclass
 class DialogueSample:
@@ -60,7 +62,7 @@ class EmpathyDataProcessor:
     - Loads EmpatheticDialogues from CSV files
     - Uses LLM (ChatGLM4) for emotion reason annotation
     - Handles tokenization and label alignment
-    - Supports BIO and IO tagging schemes
+    - Uses IO tagging scheme only: {O: 0, EM: 1}
     - Implements 8:1:1 train/valid/test split
     """
     
@@ -70,7 +72,6 @@ class EmpathyDataProcessor:
         llm_model_path: str = None,
         tokenizer_model: str = "bert-base",
         max_length: int = 512,
-        tagging_scheme: str = "IO",  # "BIO" or "IO"
         cache_dir: str = "./cache"
     ):
         """
@@ -81,14 +82,12 @@ class EmpathyDataProcessor:
             llm_model_path: Path to local LLM model for annotation
             tokenizer_model: Model name or path for tokenizer
             max_length: Maximum sequence length
-            tagging_scheme: Either "BIO" or "IO" for label encoding
             cache_dir: Directory for caching processed data
         """
         self.data_dir = Path(data_dir)
         self.llm_model_path = llm_model_path
         self.tokenizer_model = tokenizer_model
         self.max_length = max_length
-        self.tagging_scheme = tagging_scheme
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         
@@ -96,14 +95,9 @@ class EmpathyDataProcessor:
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_model)
         
         # Label mappings
-        if tagging_scheme == "BIO":
-            self.label_to_id = {"O": 0, "B-EM": 1, "I-EM": 2}
-            self.id_to_label = {0: "O", 1: "B-EM", 2: "I-EM"}
-            self.num_labels = 3
-        else:  # IO scheme
-            self.label_to_id = {"O": 0, "EM": 1}
-            self.id_to_label = {0: "O", 1: "EM"}
-            self.num_labels = 2
+        self.label_to_id = {"O": 0, "EM": 1}
+        self.id_to_label = {0: "O", 1: "EM"}
+        self.num_labels = 2
         
         # Initialize LLM for annotation (if provided)
         self.llm_model = None
@@ -150,14 +144,15 @@ class EmpathyDataProcessor:
         dialogues = []
         
         # Load train, valid, test splits
-        for split in ['train']: # , 'valid', 'test'
+        for split in ['sample_train']: # , 'valid', 'test'
             csv_file = self.data_dir / f"{split}.csv"
             if not csv_file.exists():
                 logger.warning(f"File not found: {csv_file}")
                 continue
             
             logger.info(f"Loading {split} data...")
-            df = pd.read_csv(csv_file)
+            df = pd.read_csv(csv_file, encoding='latin-1', 
+                            engine='python', on_bad_lines='skip')
             
             for idx, row in df.iterrows():
                 # Extract dialogue information
@@ -173,7 +168,7 @@ class EmpathyDataProcessor:
                 if utterance and len(utterance.strip()) > 0:
                     # Create sample without labels initially
                     sample = DialogueSample(
-                        dialogue_id=conv_id,
+                        conv_id=conv_id,
                         speaker_id=speaker_idx,
                         utterance=utterance,
                         utterance_id=utterance_idx,
@@ -204,7 +199,7 @@ class EmpathyDataProcessor:
             List of annotated DialogueSample objects
         """
         # Check cache first
-        cache_file = self.cache_dir / f"annotated_dialogues_{self.tagging_scheme}.pkl"
+        cache_file = self.cache_dir / f"annotated_dialogues_{self.num_labels}.pkl"
         if cache_file.exists():
             logger.info("Loading annotated dialogues from cache...")
             with open(cache_file, 'rb') as f:
@@ -363,33 +358,6 @@ Your output:
         
         return tokens, labels
     
-    def convert_to_bio_labels(self, tokens: List[str], labels: List[str]) -> List[str]:
-        """
-        Convert IO labels to BIO format.
-        
-        Args:
-            tokens: List of tokens
-            labels: List of IO labels (<em>/<noem>)
-            
-        Returns:
-            List of BIO labels
-        """
-        bio_labels = []
-        in_entity = False
-        
-        for label in labels:
-            if label == '<em>':
-                if not in_entity:
-                    bio_labels.append('B-EM')
-                    in_entity = True
-                else:
-                    bio_labels.append('I-EM')
-            else:  # <noem>
-                bio_labels.append('O')
-                in_entity = False
-        
-        return bio_labels
-    
     def tokenize_and_align_labels(self, dialogues: List[DialogueSample]) -> List[TokenizedSample]:
         """
         Tokenize samples and align labels with subword tokens.
@@ -405,12 +373,8 @@ Your output:
         tokenized_samples = []
         
         for dialogue in dialogues:
-            # Convert labels to appropriate scheme
-            if self.tagging_scheme == "BIO":
-                scheme_labels = self.convert_to_bio_labels(dialogue.tokens, dialogue.labels)
-            else:  # IO
-                scheme_labels = [label.replace('<em>', 'EM').replace('<noem>', 'O') 
-                               for label in dialogue.labels]
+            scheme_labels = [label.replace('<em>', 'EM').replace('<noem>', 'O') 
+                            for label in dialogue.labels]
             
             # Tokenize with the model tokenizer
             tokenized = self.tokenizer(
@@ -654,8 +618,7 @@ def test_data_processor():
     """Test function for data processor."""
     processor = EmpathyDataProcessor(
         data_dir="./dataset",
-        tokenizer_model="roberta-base",
-        tagging_scheme="BIO"
+        tokenizer_model="roberta-base"
     )
     
     # Test loading dialogues

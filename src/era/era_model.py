@@ -38,16 +38,28 @@ class ERAConfig(PretrainedConfig):
     def __init__(
         self,
         bert_model: str = "bert-base",
-        num_labels: int = 3,
+        num_labels: int = 2,
         hidden_size: int = 768,
         dropout_rate: float = 0.1,
         use_crf: bool = True,
         frozen_layers: int = 6,
-        tagging_scheme: str = "BIO",
         crf_reduction: str = "mean",
         ignore_index: int = -100,
         **kwargs
     ):
+        """
+        Initialize ERA configuration.
+        
+        Args:
+            bert_model: Pre-trained BERT model name
+            num_labels: Number of labels (2 for IO scheme: O, EM)
+            hidden_size: Hidden size of BERT model
+            dropout_rate: Dropout rate for classification head
+            use_crf: Whether to use CRF layer
+            frozen_layers: Number of BERT layers to freeze
+            crf_reduction: CRF loss reduction method
+            ignore_index: Index to ignore in loss calculation
+        """
         """
         Initialize ERA configuration.
         
@@ -58,7 +70,6 @@ class ERAConfig(PretrainedConfig):
             dropout_rate: Dropout rate for classification head
             use_crf: Whether to use CRF layer
             frozen_layers: Number of BERT layers to freeze
-            tagging_scheme: "BIO" or "IO" tagging scheme
             crf_reduction: CRF loss reduction method
             ignore_index: Index to ignore in loss calculation
         """
@@ -70,7 +81,6 @@ class ERAConfig(PretrainedConfig):
         self.dropout_rate = dropout_rate
         self.use_crf = use_crf
         self.frozen_layers = frozen_layers
-        self.tagging_scheme = tagging_scheme
         self.crf_reduction = crf_reduction
         self.ignore_index = ignore_index
 
@@ -130,7 +140,6 @@ class ERA_BERT_CRF(PreTrainedModel):
         
         logger.info(f"ERA model initialized:")
         logger.info(f"  - Encoder: {config.bert_model}")
-        logger.info(f"  - Labels: {config.num_labels} ({config.tagging_scheme})")
         logger.info(f"  - Frozen layers: {config.frozen_layers}")
         logger.info(f"  - Use CRF: {self.use_crf}")
         logger.info(f"  - Dropout: {config.dropout_rate}")
@@ -219,13 +228,6 @@ class ERA_BERT_CRF(PreTrainedModel):
             token_type_ids: Token type IDs [batch_size, seq_len] (optional)
             labels: Ground truth labels [batch_size, seq_len] (optional)
             return_dict: Whether to return as dictionary
-            
-        Returns:
-            Dictionary containing:
-            - loss: Training loss (if labels provided)
-            - logits: Classification logits [batch_size, seq_len, num_labels]
-            - predictions: Predicted labels [batch_size, seq_len] (if CRF used)
-            - hidden_states: BERT hidden states [batch_size, seq_len, hidden_size]
         """
         # BERT encoder
         bert_inputs = {
