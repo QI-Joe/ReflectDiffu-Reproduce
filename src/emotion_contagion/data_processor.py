@@ -22,6 +22,8 @@ from torch.utils.data import Dataset, DataLoader
 from typing import List, Dict, Tuple, Optional, Union
 import json
 import logging
+import os
+import pickle
 
 logger = logging.getLogger(__name__)
 
@@ -42,26 +44,57 @@ class EmotionContagionDataProcessor:
             max_length: Maximum sequence length for padding/truncation
         """
         self.max_length = max_length
-        self.label_to_id = {"noem": 0, "em": 1}  # Reason label mapping
+        self.label_to_id = {"<noem>": 0, "<em>": 1}  # Reason label mapping
         self.id_to_label = {v: k for k, v in self.label_to_id.items()}
         
     def load_data(self, data_path: str) -> List[Dict]:
         """
-        Load data from JSON file.
-        
+        Load data from a pickle (.pkl) file, a directory of pickle files, or (fallback) a JSON file.
+
         Args:
-            data_path: Path to JSON file containing the data
-            
+            data_path: Path to a .pkl/.json file or a directory containing .pkl files.
+
         Returns:
-            List of data samples
+            List of data sample dicts
         """
-        with open(data_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        
-        logger.info(f"Loaded {len(data)} samples from {data_path}")
-        return data
+        data: List[Dict] = []
+
+        if os.path.isdir(data_path):
+            pkl_files = sorted(
+                [
+                    os.path.join(data_path, fn)
+                    for fn in os.listdir(data_path)
+                    if fn.endswith('.pkl')
+                ]
+            )
+            if not pkl_files:
+                raise FileNotFoundError(f"No .pkl files found in directory: {data_path}")
+            for pf in pkl_files:
+                with open(pf, 'rb') as f:
+                    loaded = pickle.load(f)
+                if isinstance(loaded, list):
+                    data.extend(loaded)
+                else:
+                    data.append(loaded)
+            logger.info(f"Loaded {len(data)} samples from {len(pkl_files)} pickle files in {data_path}")
+            return data
+
+        # Single file handling
+        if data_path.endswith('.pkl'):
+            with open(data_path, 'rb') as f:
+                loaded = pickle.load(f)
+            if isinstance(loaded, list):
+                data = loaded
+            else:
+                data = [loaded]
+            logger.info(f"Loaded {len(data)} samples from pickle file {data_path}")
+            return data
+
+        raise ValueError(
+            f"Unsupported data file type for '{data_path}'. Expected directory or .pkl file."
+        )
     
-    def process_sample(self, sample: Dict) -> Dict:
+    def process_sample(self, sample: Dict, user: bool) -> Dict:
         """
         Process a single sample to extract tokens, labels, and create masks.
         
@@ -72,8 +105,8 @@ class EmotionContagionDataProcessor:
             Processed sample with aligned tokens/labels and attention mask
         """
         # Extract tokens and labels from sentence1
-        tokens = sample["sentence1"][0]  # [token1, token2, ..., tokenn]
-        labels = sample["sentence1"][1]  # [label1, label2, ..., labeln]
+        tokens, labels = zip(*sample)
+        tokens, labels = list(tokens), list(labels)
         
         # Validate alignment
         if len(tokens) != len(labels):
@@ -105,8 +138,8 @@ class EmotionContagionDataProcessor:
             "labels": padded_labels,
             "attention_mask": attention_mask,
             "seq_len": seq_len,
-            "user": sample.get("user", False),
-            "origin_prompt": sample.get("origin_prompt", "")
+            "user": user,
+            "origin_prompt": " ".join(tokens)
         }
     
     def process_batch(self, samples: List[Dict]) -> List[Dict]:
@@ -121,13 +154,13 @@ class EmotionContagionDataProcessor:
         """
         processed_samples = []
         
-        for sample in samples:
+        for i, sample in enumerate(samples):
             try:
-                processed = self.process_sample(sample)
+                processed = self.process_sample(sample, bool((i+1)%2))
                 processed_samples.append(processed)
             except Exception as e:
                 logger.warning(f"Failed to process sample: {e}")
-                continue
+                raise Exception(f"Error processing sample: {sample}") from e
                 
         return processed_samples
     

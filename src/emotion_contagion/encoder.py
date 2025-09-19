@@ -16,10 +16,10 @@ import torch.nn.functional as F
 import math
 from typing import Dict, List, Optional, Tuple, Union
 import logging
-from foundation_emb import WordEmbedding, SinusoidalPositionalEncoding, ReasonEmbedding
+from .foundation_emb import WordEmbedding, SinusoidalPositionalEncoding, ReasonEmbedding
 
 from .config import EmotionContagionConfig
-from contrastive_expert import CONExpert
+from .contrastive_expert import CONExpert
 
 logger = logging.getLogger(__name__)
 
@@ -315,3 +315,92 @@ class EmotionContagionEncoder(nn.Module):
         }
         
         return results
+
+    def loss(
+        self,
+        input1: torch.Tensor,
+        labels: torch.Tensor,
+        temperature: float = 0.07
+    ) -> torch.Tensor:
+        """
+        Compute supervised NT-Xent (InfoNCE) loss over a batch.
+
+        Inputs:
+        - input1: Tensor of features [B, D], e.g., Q from forward()["Q"].
+                  Will be L2-normalized before similarity computation.
+        - labels: LongTensor of emotion class ids [B]. Samples with the same
+                  label are treated as positives for each anchor.
+        - temperature: Scalar temperature τ for scaling cosine similarities.
+
+        Output:
+        - Scalar tensor: mean NT-Xent loss over anchors that have at least
+          one positive in the batch. If no positives exist, returns 0.0.
+        """
+        z = F.normalize(input1, dim=-1)  # [B, D]
+        device = z.device
+        B = z.size(0)
+
+        # Cosine similarity matrix scaled by temperature: [B, B]
+        sim = torch.matmul(z, z.t()) / temperature
+
+        # Mask out self-comparisons
+        self_mask = torch.eye(B, dtype=torch.bool, device=device)
+
+        # Positive mask: same label and not self
+        labels = labels.view(-1)
+        pos_mask = labels.unsqueeze(0) == labels.unsqueeze(1)  # [B, B]
+        pos_mask = pos_mask & (~self_mask)
+
+        # For numerical stability, subtract per-row max before exp
+        sim_max, _ = sim.max(dim=1, keepdim=True)              # [B, 1]
+        exp_sim = torch.exp(sim - sim_max)                     # [B, B]
+
+        # Denominator: all non-self pairs
+        denom = (exp_sim * (~self_mask)).sum(dim=1)            # [B]
+
+        # Numerator: sum over positives for each anchor
+        numer = (exp_sim * pos_mask).sum(dim=1)                # [B]
+
+        # Consider only anchors that have at least one positive
+        num_pos = pos_mask.sum(dim=1)                          # [B]
+        valid = num_pos > 0
+
+        if valid.any():
+            # Avoid division by zero; denom>0 as long as B>1
+            frac = numer[valid] / denom[valid]
+            loss = -torch.log(torch.clamp(frac, min=1e-12)).mean()
+        else:
+            loss = torch.tensor(0.0, device=device, dtype=z.dtype)
+
+        return loss
+    
+class EmotionClassifier(nn.Module):
+    def __init__(self, d_in: int, num_emotions: int):
+        super().__init__()
+        self.cls = nn.Linear(d_in, num_emotions)
+
+    def forward(self, Q: torch.Tensor):  # Q: [B, D]
+        logits = self.cls(Q)             # [B, num_emotions]
+        return logits
+
+def ce_loss_for_emotion(
+    logits: torch.Tensor,     # [B, num_emotions]
+    labels: torch.Tensor,     # [B]
+    label_smoothing: float = 0.0
+) -> torch.Tensor:
+    """
+    Standard CE for emotion classification.
+    Optionally with label smoothing.
+    """
+    if label_smoothing > 0:
+        # Label smoothing implementation
+        num_classes = logits.size(-1)
+        with torch.no_grad():
+            true_dist = torch.zeros_like(logits)
+            true_dist.fill_(label_smoothing / (num_classes - 1))
+            true_dist.scatter_(1, labels.unsqueeze(1), 1.0 - label_smoothing)
+        log_probs = F.log_softmax(logits, dim=-1)
+        loss = -(true_dist * log_probs).sum(dim=-1).mean()
+    else:
+        loss = F.cross_entropy(logits, labels)
+    return loss

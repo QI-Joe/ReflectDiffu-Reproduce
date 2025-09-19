@@ -25,7 +25,7 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModel
 
 logger = logging.getLogger(__name__)
-os.environ["HL_ENDPOINT"] = "https://hf-mirror.com"
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 
 @dataclass
 class DialogueSample:
@@ -212,7 +212,11 @@ class EmpathyDataProcessor:
         for i, dialogue in enumerate(dialogues):
             if i % 100 == 0:
                 logger.info(f"Annotating dialogue {i+1}/{len(dialogues)}")
-            
+            if dialogue.speaker_id:
+                dialogue.tokens=dialogue.utterance.split()
+                dialogue.labels = ["<noem>" for _ in len(tokens)]
+                annotated_dialogues.append(dialogue)
+                continue
             try:
                 # Get LLM annotation
                 tokens, labels = self._get_llm_annotation(dialogue)
@@ -233,7 +237,7 @@ class EmpathyDataProcessor:
         logger.info(f"Annotated {len(annotated_dialogues)} dialogues")
         return annotated_dialogues
     
-    def _get_llm_annotation(self, dialogue: DialogueSample) -> Tuple[List[str], List[str]]:
+    def _get_llm_annotation(self, dialogue: DialogueSample, given_query_function: callable=None) -> Tuple[List[str], List[str]]:
         """
         Get emotion reason annotation from LLM.
         
@@ -247,9 +251,12 @@ class EmpathyDataProcessor:
         prompt = self._create_annotation_prompt(dialogue)
         
         # Get LLM response
-        with torch.no_grad():
-            response = self._query_llm(prompt)
-        
+        if not given_query_function:
+            response = given_query_function(prompt)
+        else:
+            with torch.no_grad():
+                response = self._query_llm(prompt)
+
         # Parse response to extract tokens and labels
         tokens, labels = self._parse_llm_response(response, dialogue.utterance)
         
@@ -266,15 +273,10 @@ class EmpathyDataProcessor:
             Formatted prompt string
         """
         prompt = f"""
-Please analyze the following dialogue and identify words that represent emotion reasons.
-Mark each word with <em> if it's an emotion reason word, or <noem> if it's not.
-
 Dialogue Context:
 Emotion: {dialogue.emotion}
-Situation: {dialogue.situation}
-Speaker: {dialogue.speaker}
-
-Utterance: "{dialogue.utterance}"
+Context: {dialogue.prompt}
+Speaker: {dialogue.utterance}
 
 Please provide the output in the following format:
 word1:<em/noem> word2:<em/noem> ...
@@ -618,7 +620,7 @@ def test_data_processor():
     """Test function for data processor."""
     processor = EmpathyDataProcessor(
         data_dir="./dataset",
-        tokenizer_model="roberta-base"
+        tokenizer_model="google-bert/bert-base-uncased"
     )
     
     # Test loading dialogues

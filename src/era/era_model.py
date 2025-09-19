@@ -369,7 +369,7 @@ class ERA_BERT_CRF(PreTrainedModel):
 
 
 def create_era_model(
-    bert_model: str = "roberta-base",
+    bert_model: str = "google-bert/bert-base-uncased",
     num_labels: int = 3,
     use_crf: bool = True,
     frozen_layers: int = 6,

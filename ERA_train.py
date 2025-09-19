@@ -51,6 +51,7 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -72,7 +73,7 @@ Examples:
     python main.py --config configs/custom.json
     
     # Train with custom parameters
-    python main.py --bert_model roberta-base --batch_size 32 --num_epochs 5
+    python main.py --bert_model google-bert/bert-base-uncased --batch_size 32 --num_epochs 5
     
     # Debug mode with small dataset
     python main.py --debug --max_train_samples 100
@@ -123,7 +124,7 @@ Examples:
     parser.add_argument(
         "--bert_model", 
         type=str,
-        help="BERT model name or path (e.g., roberta-base)"
+        help="BERT model name or path (e.g., google-bert/bert-base-uncased)"
     )
     parser.add_argument(
         "--use_crf", 

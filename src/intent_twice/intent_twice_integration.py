@@ -43,11 +43,12 @@ class IntentTwiceConfig:
 
 class EmotionMappings:
     """
-    Emotion mappings for EmpatheticDialogues 32 emotions.
-    Maps emotion IDs to groups and polarities as required by Intent Twice.
+    Emotion -> fine-grained emotion-group -> Top-3 Intentrefer
+    与论文 Table 1 对齐的工程化映射。
+    注意：下面的意图名称->id 需要与你项目的 intent 词表严格一致！
     """
-    
-    # EmpatheticDialogues 32 emotion categories
+
+    # 32类情感（与数据集顺序一致，保持你现有的列表不变）
     EMOTIONS = [
         "sentimental", "afraid", "proud", "faithful", "terrified", "joyful", 
         "angry", "sad", "jealous", "hopeful", "prepared", "embarrassed",
@@ -56,52 +57,79 @@ class EmotionMappings:
         "trusting", "disgusted", "anticipating", "anxious", "grateful",
         "impressed", "apprehensive", "devastated", "content"
     ]
-    
-    # Emotion to group mapping (based on Table 1 reference)
-    # Groups represent common intent categories
-    EMOTION_TO_GROUP = {
-        # Group 0: Positive emotions
-        0: 0, 2: 0, 3: 0, 5: 0, 9: 0, 10: 0, 12: 0, 17: 0, 18: 0, 19: 0,
-        22: 0, 23: 0, 25: 0, 27: 0, 28: 0, 31: 0,
-        # Group 1: Negative emotions  
-        1: 1, 4: 1, 6: 1, 7: 1, 8: 1, 11: 1, 13: 1, 14: 1, 15: 1, 16: 1,
-        20: 1, 21: 1, 24: 1, 26: 1, 29: 1, 30: 1
+
+    # 全量意图词表（示例，需与你项目真实意图词表一一对应）
+    INTENTS = [
+        "acknowledging", "encouraging", "neutral",
+        "sympathizing", "consoling", "suggesting", "wishing",
+        "agreeing", "questioning"  # 如果你的任务里有其它意图，请补齐
+    ]
+    INTENT2ID: Dict[str, int] = {name: i for i, name in enumerate(INTENTS)}
+
+    # 定义情感组（按论文Table 1；faithful重复出现，工程上需选一组）
+    GROUPS = {
+        # G0: surprised, proud, impressed, nostalgic, trusting, faithful, prepared
+        0: ["surprised", "proud", "impressed", "nostalgic", "trusting", "faithful", "prepared"],
+
+        # G1: excited, confident, joyful, grateful, content, caring  (faithful 在G0已归属)
+        1: ["excited", "confident", "joyful", "grateful", "content", "caring"],
+
+        # G2: angry, disappointed
+        2: ["angry", "disappointed"],
+
+        # G3: hopeful, sentimental
+        3: ["hopeful", "sentimental"],
+
+        # G4: anticipating, lonely, afraid, anxious, guilty, embarrassed, sad,
+        #     apprehensive, terrified, jealous
+        4: ["anticipating", "lonely", "afraid", "anxious", "guilty", "embarrassed",
+            "sad", "apprehensive", "terrified", "jealous"],
     }
-    
-    # Emotion to polarity mapping
-    EMOTION_TO_POLARITY = {
-        # Positive emotions
-        0: "pos", 2: "pos", 3: "pos", 5: "pos", 9: "pos", 10: "pos", 
-        12: "pos", 17: "pos", 18: "pos", 19: "pos", 22: "pos", 23: "pos", 
-        25: "pos", 27: "pos", 28: "pos", 31: "pos",
-        # Negative emotions
-        1: "neg", 4: "neg", 6: "neg", 7: "neg", 8: "neg", 11: "neg", 
-        13: "neg", 14: "neg", 15: "neg", 16: "neg", 20: "neg", 21: "neg", 
-        24: "neg", 26: "neg", 29: "neg", 30: "neg"
+
+    # 每组的 Top-3 Intentrefer（把名称映射为 id）
+    REFER_BY_GROUP_NAMES = {
+        0: ["acknowledging", "encouraging", "neutral"],
+        1: ["encouraging", "sympathizing", "acknowledging"],
+        2: ["consoling", "suggesting", "encouraging"],
+        3: ["encouraging", "wishing", "consoling"],
+        4: ["consoling", "encouraging", "neutral"],
     }
-    
-    # Intent reference map (group_id -> top-3 intent ids)
-    # These would be populated based on actual intent vocabulary
-    REFER_MAP = {
-        0: [0, 1, 2],   # Top-3 intents for positive group
-        1: [3, 4, 5],   # Top-3 intents for negative group
-    }
-    
+    # NOTE: Can't compute REFER_BY_GROUP here using a comprehension because
+    # comprehensions within class scope don't see class-level names in Python 3.
+    # We'll assign it right after the class definition.
+    REFER_BY_GROUP: Dict[int, List[int]]
+
+    # polarity（正/负）仍可保留，用于选择 Emopos/Emoneg
+    POSITIVE = set(["surprised", "proud", "impressed", "nostalgic", "trusting", "faithful", "prepared",
+                    "excited", "confident", "joyful", "grateful", "content", "caring", "hopeful", "sentimental"])
+    # 其他为负面
+    @classmethod
+    def emotion_name(cls, eid: int) -> str:
+        return cls.EMOTIONS[eid]
+
     @classmethod
     def get_group_id(cls, emotion_id: int) -> int:
-        """Get group ID for emotion ID."""
-        return cls.EMOTION_TO_GROUP.get(emotion_id, 1)  # Default to negative group
-    
-    @classmethod
-    def get_polarity(cls, emotion_id: int) -> str:
-        """Get polarity for emotion ID."""
-        return cls.EMOTION_TO_POLARITY.get(emotion_id, "neg")  # Default to negative
-    
-    @classmethod
-    def get_refer_candidates(cls, group_id: int) -> List[int]:
-        """Get top-3 intent candidates for group ID."""
-        return cls.REFER_MAP.get(group_id, [3, 4, 5])  # Default to negative intents
+        name = cls.emotion_name(emotion_id)
+        for gid, members in cls.GROUPS.items():
+            if name in members:
+                return gid
+        # 若未匹配到（不应发生），可回退到大负面组G4
+        return 4
 
+    @classmethod
+    def get_refer_candidates(cls, emotion_id: int) -> List[int]:
+        gid = cls.get_group_id(emotion_id)
+        return cls.REFER_BY_GROUP[gid]
+
+    @classmethod
+    def is_positive(cls, emotion_id: int) -> bool:
+        return cls.emotion_name(emotion_id) in cls.POSITIVE
+
+# Post-class initialization that depends on class attributes
+EmotionMappings.REFER_BY_GROUP = {
+    gid: [EmotionMappings.INTENT2ID[n] for n in names]
+    for gid, names in EmotionMappings.REFER_BY_GROUP_NAMES.items()
+}
 
 class IntentTwiceModule(nn.Module):
     """
@@ -161,12 +189,9 @@ class IntentTwiceModule(nn.Module):
             for emo_id in emo_ids
         ], device=device, dtype=torch.long)
         
-        polarity_strs = [
-            EmotionMappings.get_polarity(int(emo_id.item())) 
-            for emo_id in emo_ids
-        ]
+        # Use EmotionMappings.is_positive to determine polarity
         is_pos_mask = torch.tensor([
-            pol == "pos" for pol in polarity_strs
+            EmotionMappings.is_positive(int(emo_id.item())) for emo_id in emo_ids
         ], device=device, dtype=torch.bool)
         
         return group_ids, is_pos_mask
@@ -255,9 +280,14 @@ class IntentTwiceModule(nn.Module):
         Emopos = emu_stats["emopos"]  # [B, D]
         Emoneg = emu_stats["emoneg"]  # [B, D]
         
-        # Compute KL losses (simplified - would need proper CVAE KL computation)
-        Lklpos = torch.tensor(0.0, device=device)  # Placeholder
-        Lklneg = torch.tensor(0.0, device=device)  # Placeholder
+        # Compute KL losses from EMU stats (averaged over batch)
+        Lklpos = emu_stats.get("kldpos", torch.zeros(Q.size(0), device=device))
+        Lklneg = emu_stats.get("kldneg", torch.zeros(Q.size(0), device=device))
+        # Ensure tensor shapes then reduce to scalars
+        if isinstance(Lklpos, torch.Tensor):
+            Lklpos = Lklpos.mean()
+        if isinstance(Lklneg, torch.Tensor):
+            Lklneg = Lklneg.mean()
         
         # ==================== Step 4: Intent Policy ====================
         pol = intent_policy_module or self.intent_policy_module
@@ -279,9 +309,11 @@ class IntentTwiceModule(nn.Module):
         # ==================== Step 5: Intent Vector Generation ====================
         chosen_intent_emb = self.intent_embed(chosen_intent_ids)  # [B, I]
         chosen_intent_vec = self.intent_proj(chosen_intent_emb)   # [B, D]
-        
+
         # ==================== Step 6: Loss Computation ====================
-        Ltwice = Lklpos + Lklneg + Lintent + Lpolicy
+        # Follow loss-compute.md: L_twice = L_kl_pos + L_kl_neg + L_intent
+        # (policy RL term can be optimized separately, not added by default)
+        Ltwice = Lklpos + Lklneg + Lintent
         
         # ==================== Return Results ====================
         results = {
@@ -315,102 +347,6 @@ class IntentTwiceModule(nn.Module):
         return results
 
 
-def intent_twice_step(
-    encoder_module: nn.Module,
-    emu_module: nn.Module,
-    intent_policy_module: nn.Module,
-    batch: Dict[str, Any],
-    refer_map: Optional[Dict[int, List[int]]] = None,
-    emotion2group: Optional[Dict[int, int]] = None,
-    emotion2polarity: Optional[Dict[int, str]] = None,
-) -> Dict[str, torch.Tensor]:
-    """
-    Standalone function for Intent Twice step as described in markdown.
-    
-    This follows the markdown algorithm, adapted to dynamic module interfaces.
-    """
-    # defaults
-    if refer_map is None:
-        refer_map = EmotionMappings.REFER_MAP
-    if emotion2group is None:
-        emotion2group = EmotionMappings.EMOTION_TO_GROUP
-    if emotion2polarity is None:
-        emotion2polarity = EmotionMappings.EMOTION_TO_POLARITY
-
-    # 1) Emotion-Contagion encoding
-    enc_out = encoder_module(
-        tokens=batch["tokens"],
-        label_ids=batch["label_ids"],
-        attention_mask=batch["attention_mask"],
-        h_tilde=batch.get("h_tilde", None),
-    )
-    Q = enc_out["Q"]
-    p = enc_out.get("p")
-    if p is None:
-        P = enc_out.get("P", Q)
-        if P.size(-1) == 32:
-            p = F.softmax(P, dim=-1)
-        else:
-            clf = nn.Linear(Q.size(-1), 32, device=Q.device)
-            p = F.softmax(clf(P), dim=-1)
-
-    # 2) Get top-1 emotion id from distribution
-    emo_ids = p.argmax(dim=-1)  # [B], int
-
-    # 3) Compute is_pos_mask and group_ids
-    group_ids = torch.tensor([
-        emotion2group[int(e.item())] for e in emo_ids
-    ], device=Q.device, dtype=torch.long)  # [B]
-    
-    polarity = [emotion2polarity[int(e.item())] for e in emo_ids]
-    # Neutral merged into negative (as per markdown)
-    is_pos_mask = torch.tensor([
-        1 if pol == 'pos' else 0 for pol in polarity
-    ], device=Q.device, dtype=torch.bool)  # [B]
-
-    # 4) EMU diffusion sampling (sampling state construction)
-    # Training: random step t, add/remove noise within EMU; inference: multi-step
-    try:
-        Emofused, emu_stats = emu_module(Q, p, is_pos_mask, enc_out.get("H", Q.unsqueeze(1)))
-        Emopos = emu_stats.get("emopos", Q)
-        Emoneg = emu_stats.get("emoneg", Q)
-        Lklpos = torch.tensor(0.0, device=Q.device)
-        Lklneg = torch.tensor(0.0, device=Q.device)
-    except Exception:
-        Emopos = Emoneg = Emofused = Q
-        Lklpos = Lklneg = torch.tensor(0.0, device=Q.device)
-
-    # 5) Intent Policy: policy sampling on Intentrefer (Top-3) (Action Definition)
-    pol_out = intent_policy_module(Emopos, Emoneg, Emofused, group_ids, is_pos_mask)
-    chosen_intent_ids = pol_out["chosen_intent_ids"]
-
-    # 6) Aggregate Intent Twice loss (Equation 10, with Lpolicy for stability)
-    Ltwice = Lklpos + Lklneg + pol_out["Lintent"] + pol_out["Lpolicy"]
-
-    # 7) Return intent control signal for decoder
-    chosen_intent_vec = intent_policy_module.intent_embed(chosen_intent_ids)  # [B, I]
-
-    return {
-        "Q": Q,
-        "p": p,
-        "Emopos": Emopos,
-        "Emoneg": Emoneg,
-        "Emofused": Emofused,
-        "group_ids": group_ids,
-        "is_pos_mask": is_pos_mask,
-        "chosen_intent_ids": chosen_intent_ids,
-        "chosen_intent_vec": chosen_intent_vec,
-        "Ltwice": Ltwice,
-        "monitor": {
-            "reward": pol_out["reward"],
-            "Lklpos": float(Lklpos),
-            "Lklneg": float(Lklneg),
-            "Lintent": float(pol_out["Lintent"]),
-            "Lpolicy": float(pol_out["Lpolicy"])
-        }
-    }
-
-
 def train_step(
     intent_twice_module: IntentTwiceModule,
     batch: Dict[str, torch.Tensor],
@@ -439,29 +375,64 @@ def train_step(
         h_tilde=batch.get("h_tilde", None)
     )
     
-    # 1) Emotion classification loss (Lem) using Q/p
-    # This would typically be CE + NT-Xent from contrastive experts
+    # 1) Emotion classification loss (L_em = CE + NT-Xent)
+    Q = itw["Q"]
+    p = itw["p"]
+    device = Q.device
+    Lem_ce = torch.tensor(0.0, device=device)
+    Lem_ntx = torch.tensor(0.0, device=device)
     if "emotion_labels" in batch:
-        Lem = F.cross_entropy(itw["p"], batch["emotion_labels"])
-    else:
-        Lem = torch.tensor(0.0, device=itw["Q"].device)
-    
-    # 2) Decoder loss (Lres) using Emofused + chosen_intent_vec
-    if decoder_loss_fn is not None:
-        Lres = decoder_loss_fn(batch, itw["Emofused"], itw["chosen_intent_vec"])
-    else:
-        Lres = torch.tensor(0.0, device=itw["Q"].device)
-    
-    # 3) Intent Twice loss
+        Lem_ce = F.cross_entropy(p, batch["emotion_labels"])  # [B,E] vs [B]
+        # If encoder exposes NT-Xent loss, use it over Q
+        encoder = intent_twice_module.encoder_module
+        if hasattr(encoder, "loss") and callable(getattr(encoder, "loss")):
+            Lem_ntx = encoder.loss(Q, batch["emotion_labels"])  # scalar
+    Lem = Lem_ce + Lem_ntx
+
+    # 2) Intent Twice loss
     Ltwice = itw["Ltwice"]
     
-    # 4) Total loss (Equation 12)
+    # 3) Response decoding loss (optional)
+    Lres = torch.tensor(0.0, device=device)
+    if decoder_loss_fn is not None and all(k in batch for k in ["trg_input_ids", "gold_response_ids", "src_token_ids"]):
+        # Build memory for decoder: use encoder H with Emofused fuse (inline to avoid import cycles)
+        enc = intent_twice_module.encoder_module
+        # Recompute encoder to get H; we already ran it within module, but we don't have H here; run lightweight forward
+        enc_out = enc(
+            tokens=batch["tokens"],
+            label_ids=batch["label_ids"],
+            attention_mask=batch["attention_mask"],
+            h_tilde=batch.get("h_tilde", None)
+        )
+        H = enc_out["H"]  # [B, L, D]
+        Emofused = itw["Emofused"]  # [B, D]
+        memory = H + Emofused.unsqueeze(1)  # [B, L, D]
+
+        # Decoder module and loss fn are provided by caller; compute Pw inside fn
+        dec_out = decoder_loss_fn(
+            trg_input_ids=batch["trg_input_ids"],
+            memory=memory,
+            src_token_ids=batch["src_token_ids"],
+            src_key_padding_mask=batch.get("src_key_padding_mask", batch["attention_mask"] == 0),
+            tgt_key_padding_mask=batch.get("tgt_key_padding_mask", None),
+            gold_ids=batch["gold_response_ids"],
+        )
+        if isinstance(dec_out, dict) and "loss" in dec_out:
+            Lres = dec_out["loss"]
+        elif torch.is_tensor(dec_out):
+            Lres = dec_out
+
+    # 4) Total loss
     L = delta * Lem + zeta * Ltwice + eta * Lres
     
-    return {
+    out: Dict[str, float] = {
         "loss": float(L),
         "Lem": float(Lem),
+        "Lem_ce": float(Lem_ce),
+        "Lem_ntx": float(Lem_ntx),
         "Ltwice": float(Ltwice),
-        "Lres": float(Lres),
-        **itw["monitor"]
     }
+    if torch.is_tensor(Lres):
+        out["Lres"] = float(Lres)
+    out.update(itw["monitor"])  # reward, KLs, etc.
+    return out

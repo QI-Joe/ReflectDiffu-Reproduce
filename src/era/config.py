@@ -24,7 +24,7 @@ class ERAConfig:
     """
     
     # ==================== Model Configuration ====================
-    bert_model: str = "roberta-base"  # Base model architecture
+    bert_model: str = "google-bert/bert-base-uncased"  # Base model architecture
     num_labels: int = 2  # IO scheme: O, EM
     max_length: int = 512  # Maximum sequence length
     
@@ -303,7 +303,7 @@ class ERAConfigPresets:
             ERAConfig with NuNER baseline settings
         """
         return ERAConfig(
-            bert_model="roberta-base",
+            bert_model="google-bert/bert-base-uncased",
             frozen_layers=6,
             learning_rate=3e-5,
             encoder_lr=3e-5,

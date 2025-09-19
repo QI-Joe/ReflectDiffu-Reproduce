@@ -51,18 +51,20 @@ class CONExpert(nn.Module):
         super().__init__()
         self.Wpos = nn.Linear(emo_dim, emo_dim) # CxC
         self.Wneg = nn.Linear(emo_dim, emo_dim)
-        self.Eemo = nn.Embedding(input_dim, emo_dim) # ExC
+        # Project input features to emotion dimension
+        self.proj = nn.Linear(input_dim, emo_dim) 
         self.alpha = alpha
         
         nn.init.xavier_uniform_(self.Wpos.weight)
         nn.init.xavier_uniform_(self.Wneg.weight)
+        nn.init.xavier_uniform_(self.proj.weight)
         
-    def forward(self, Q: torch.Tensor, batch_text: List[str]): # shape of Q: [B, E]
+    def forward(self, Q: torch.Tensor, batch_text: List[str]): # shape of Q: [B, D]
         """
         Forward pass for the Contrastive Expert module."""
         
-        Z = self.Eemo(Q)
-        scale = 1.0/math.sqrt(Q.size(-1))
+        Z = self.proj(Q)  # Project Q to emotion dimension [B, D] -> [B, emo_dim]
+        scale = 1.0/math.sqrt(Z.size(-1))
         
         v, counts, conf_sums = decide_batch_polarity_via_vader(batch_text)
         

@@ -122,7 +122,7 @@ class EMU(nn.Module):
         """
         Q: [B, D]
         intentfirst: [B, K]
-        is_pos_mask: [B] bool，True表示走正向子模型，否则负向
+        is_pos_mask: [B] bool, True表示走正向子模型, 否则负向
         H: [B, T, D] 上下文
         返回:
           Emofused: [B, D]

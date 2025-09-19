@@ -214,3 +214,7 @@ dataset/
 .vscode/
 checkpoints/
 logs/
+test_cache/
+*.ipynb
+*.pkl
+data/

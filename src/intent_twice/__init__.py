@@ -6,7 +6,6 @@ from .intent_twice_integration import (
     IntentTwiceModule,
     IntentTwiceConfig,
     EmotionMappings,
-    intent_twice_step,
     train_step
 )
 
@@ -18,6 +17,5 @@ __all__ = [
     "IntentTwiceModule",
     "IntentTwiceConfig",
     "EmotionMappings",
-    "intent_twice_step",
     "train_step"
 ]

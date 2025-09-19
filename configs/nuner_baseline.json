@@ -1,5 +1,6 @@
 {
   "bert_model": "roberta-base",
+  "llm_model_path": "zai-org/chatglm-6b",
   "num_labels": 3,
   "tagging_scheme": "BIO",
   "max_length": 512,
