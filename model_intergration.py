@@ -112,7 +112,7 @@ class ReflectDiffu(nn.Module):
         # Data components
         self.dp = None
         self.raw_data = None
-        self.processed = None
+        self.user, self.response = list(), list()
         self.p_intent = None
         
     def _init_data_loader(self, data_path: str, batch_size: int = 4, max_length: int = 64):
@@ -121,15 +121,20 @@ class ReflectDiffu(nn.Module):
         self.dp = EmotionContagionDataProcessor(max_length=max_length)
         self.raw_data = self.dp.load_data(data_path)
         self.raw_data = self.raw_data[:batch_size * 2]  # Ensure pairs
-        self.processed = self.dp.process_batch(self.raw_data)
+        self.user, self.response = self.dp.process_batch(self.raw_data)
         
         p_intent_full = temp_load_intent()
-        self.p_intent = p_intent_full[:len(self.processed)]
+        self.p_intent = p_intent_full[:len(self.user)]
+
+        # Update vocab size based on data from user and response
+        vocab_tokens = set()
+        for sample in self.user:
+            vocab_tokens.update(tok for tok in sample['tokens'] if tok != '[PAD]')
+        for sample in self.response:
+            vocab_tokens.update(tok for tok in sample['tokens'] if tok != '[PAD]')
         
-        # Update vocab size based on data
-        vocab_tokens = sorted({tok for sample in self.processed for tok in sample['tokens'] if tok != '[PAD]'})
         self.vocab_size = max(len(vocab_tokens) + 20, 100)  # Add buffer for special tokens
-        print(f"Data loaded: {len(self.processed)} samples, vocab size: {self.vocab_size}")
+        print(f"Data loaded: {len(self.user)} user samples, {len(self.response)} response samples, vocab size: {self.vocab_size}")
         
     def _init_encoder(self):
         """Initialize emotion contagion encoder."""
@@ -138,8 +143,14 @@ class ReflectDiffu(nn.Module):
             vocab_size=self.vocab_size, model_dim=self.model_dim
         ).to(self.device)
         
-        # Build vocabulary from processed data
-        self.encoder.word_embedding.build_vocab([s['tokens'] for s in self.processed])
+        # Build vocabulary from user and response data
+        all_tokens = []
+        for sample in self.user:
+            all_tokens.extend(sample['tokens'])
+        for sample in self.response:
+            all_tokens.extend(sample['tokens'])
+        
+        self.encoder.word_embedding.build_vocab([all_tokens])
         
         # Initialize emotion classifier
         self.emotion_cls = EmotionClassifier(
@@ -183,11 +194,11 @@ class ReflectDiffu(nn.Module):
         
     def _prepare_batch_data(self):
         """Prepare batch data for training."""
-        # Prepare encoder inputs
-        tokens = [s['tokens'] for s in self.processed]
-        label_ids = torch.tensor([s['label_ids'] for s in self.processed], 
+        # Prepare encoder inputs from self.user
+        tokens = [s['tokens'] for s in self.user]
+        label_ids = torch.tensor([s['label_ids'] for s in self.user], 
                                 dtype=torch.long, device=self.device)
-        attention_mask = torch.tensor([s['attention_mask'] for s in self.processed], 
+        attention_mask = torch.tensor([s['attention_mask'] for s in self.user], 
                                      dtype=torch.long, device=self.device)
         
         # Prepare decoder inputs from response data
@@ -215,15 +226,8 @@ class ReflectDiffu(nn.Module):
         eos_id = self.encoder.word_embedding.word_to_idx['<eos>']
         pad_id = self.encoder.word_embedding.word_to_idx['[PAD]']
         
-        # Extract response tokens (odd indices in raw_data)
-        responses_tokens = []
-        for i in range(len(self.processed)):
-            if 2*i + 1 < len(self.raw_data):
-                resp_sample = self.raw_data[2*i + 1]
-                resp_tokens = [token for token, _ in resp_sample]
-                responses_tokens.append(resp_tokens)
-            else:
-                responses_tokens.append(['<eos>'])
+        # Extract response tokens from self.response
+        responses_tokens = [sample['tokens'] for sample in self.response]
         
         # Convert to IDs and create teacher-forcing inputs
         T = 16  # target sequence length
@@ -250,10 +254,10 @@ class ReflectDiffu(nn.Module):
         gold_ids = resp_ids
         tgt_key_padding_mask = (trg_input_ids == pad_id)
         
-        # Source token IDs for pointer-generator
+        # Source token IDs for pointer-generator from user data
         src_ids_from_encoder = torch.tensor(
             [[self.encoder.word_embedding.word_to_idx.get(tok, 0) for tok in s['tokens']] 
-             for s in self.processed],
+             for s in self.user],
             device=self.device, dtype=torch.long
         )
         
@@ -346,7 +350,7 @@ class ReflectDiffu(nn.Module):
             src_token_ids = src_ids_from_encoder[:, :L_emof]
         
         # Decoder forward
-        dec_out = self.decoder_with_loss(
+        dec_out = self.decoder_with_loss.forward(
             trg_input_ids=batch_data['trg_input_ids'],
             emofused=Emofused,
             src_token_ids=src_token_ids,

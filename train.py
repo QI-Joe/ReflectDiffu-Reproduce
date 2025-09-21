@@ -127,17 +127,9 @@ def train_with_evaluation(args, eval_config: Optional[EvaluationConfig] = None):
     optimizer = create_optimizer(model, lr=1e-4)
     
     # 2. 评估器初始化 (新增)
-    training_evaluator = None
-    if eval_config and EVALUATION_AVAILABLE:
-        try:
-            training_evaluator = TrainingEvaluator(model, eval_config)
-            training_evaluator.initialize()
-            print("✅ Training evaluator initialized")
-        except Exception as e:
-            logger.warning(f"Failed to initialize evaluator: {e}")
-            training_evaluator = None
-    elif eval_config and not EVALUATION_AVAILABLE:
-        logger.warning("Evaluation requested but evaluation module not available")
+    training_evaluator = TrainingEvaluator(model, eval_config)
+    training_evaluator.initialize()
+    print("✅ Training evaluator initialized")
     
     # 3. 训练循环 (轻微修改)
     print("\\n🚀 Starting Training with Evaluation...")
@@ -162,10 +154,10 @@ def train_with_evaluation(args, eval_config: Optional[EvaluationConfig] = None):
         )
         
         total_steps += steps_per_epoch
-        print(f"[Reflect-Diffu] | Completed Epoch {epoch + 1}. For loss {epoch_losses[-1]}")
+        print(f"[Reflect-Diffu] | Completed Epoch {epoch + 1}. For loss {epoch_losses[-1]['joint_loss']:.4f}, total steps {total_steps}.")
         
         # 检查是否需要评估
-        if training_evaluator and training_evaluator.should_evaluate(epoch + 1, total_steps):
+        if training_evaluator and True:
             print("\\n🔍 Running evaluation...")
             model.eval()
             with torch.no_grad():
@@ -206,16 +198,16 @@ def train_with_evaluation(args, eval_config: Optional[EvaluationConfig] = None):
     return model
 
 
-def train(args):
+def train(args, eval_config):
     """原始训练函数 (向后兼容)"""
-    return train_with_evaluation(args, eval_config=None)
+    return train_with_evaluation(args, eval_config=eval_config)
     
 
 def main():
     ap = argparse.ArgumentParser(description="ReflectDiffu Training with Integrated Evaluation")
     
     # Original training arguments
-    ap.add_argument('--ec_data', type=str, default=r"dataset/emotion_labels.pkl", 
+    ap.add_argument('--ec_data', type=str, default=r"dataset/emotion_labels_user_response.pkl", 
                    help='Path to emotion contagion pickle file or directory')
     ap.add_argument('--batch_size', type=int, default=4)
     ap.add_argument('--cuda', action='store_true', default=True)
@@ -226,13 +218,13 @@ def main():
     ap.add_argument('--eta', type=float, default=1.0, help='Weight for response loss')
     
     # Evaluation configuration arguments
-    ap.add_argument('--enable_eval', action='store_true', default=False,
+    ap.add_argument('--enable_eval', action='store_true', default=True,
                    help='Enable evaluation during training')
     ap.add_argument('--eval_every_epochs', type=int, default=1,
                    help='Evaluate every N epochs')
     ap.add_argument('--eval_every_steps', type=int, default=None,
                    help='Evaluate every N steps (overrides eval_every_epochs)')
-    ap.add_argument('--eval_data_path', type=str, default=None,
+    ap.add_argument('--eval_data_path', type=str, default="dataset/emotion_labels_test.pkl",
                    help='Path to evaluation data (uses training data if not specified)')
     ap.add_argument('--max_eval_samples', type=int, default=100,
                    help='Maximum number of evaluation samples')
@@ -244,7 +236,7 @@ def main():
                    help='Use pointer-generator during evaluation')
     ap.add_argument('--skip_bart_score', action='store_true', default=False,
                    help='Skip BARTScore computation (faster evaluation)')
-    ap.add_argument('--eval_results_dir', type=str, default="evaluation_results",
+    ap.add_argument('--eval_results_dir', type=str, default="output",
                    help='Directory to save evaluation results')
     ap.add_argument('--eval_log_examples', action='store_true', default=True,
                    help='Log generation examples during evaluation')
@@ -288,10 +280,7 @@ def main():
         print(f"  Results dir: {eval_config.results_dir}")
     
     # Run training with or without evaluation
-    if eval_config:
-        train_with_evaluation(args, eval_config)
-    else:
-        train(args)
+    train(args, eval_config)
 
 
 

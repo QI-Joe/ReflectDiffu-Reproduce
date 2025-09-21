@@ -221,3 +221,4 @@ data/
 temp/
 demo_evaluation.py
 pre-trained/
+*.ipynb

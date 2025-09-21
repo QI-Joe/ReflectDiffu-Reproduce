@@ -59,26 +59,6 @@ class EmotionContagionDataProcessor:
         """
         data: List[Dict] = []
 
-        if os.path.isdir(data_path):
-            pkl_files = sorted(
-                [
-                    os.path.join(data_path, fn)
-                    for fn in os.listdir(data_path)
-                    if fn.endswith('.pkl')
-                ]
-            )
-            if not pkl_files:
-                raise FileNotFoundError(f"No .pkl files found in directory: {data_path}")
-            for pf in pkl_files:
-                with open(pf, 'rb') as f:
-                    loaded = pickle.load(f)
-                if isinstance(loaded, list):
-                    data.extend(loaded)
-                else:
-                    data.append(loaded)
-            logger.info(f"Loaded {len(data)} samples from {len(pkl_files)} pickle files in {data_path}")
-            return data
-
         # Single file handling
         if data_path.endswith('.pkl'):
             with open(data_path, 'rb') as f:
@@ -142,27 +122,27 @@ class EmotionContagionDataProcessor:
             "origin_prompt": " ".join(tokens)
         }
     
-    def process_batch(self, samples: List[Dict]) -> List[Dict]:
-        """
-        Process a batch of samples.
-        
-        Args:
-            samples: List of raw data samples
-            
+    def process_batch(self, samples: List[Dict], ifeval: bool=False) -> List[Dict]:
+        """            
         Returns:
             List of processed samples
         """
-        processed_samples = []
+        user_batch, response_batch = list(), list()
+        batch_conversation = list()
+        
         
         for i, sample in enumerate(samples):
-            try:
-                processed = self.process_sample(sample, bool((i+1)%2))
-                processed_samples.append(processed)
-            except Exception as e:
-                logger.warning(f"Failed to process sample: {e}")
-                raise Exception(f"Error processing sample: {sample}") from e
-                
-        return processed_samples
+            user, response = sample
+            user_process, response_process = [self.process_sample(single_user, True) for single_user in user], \
+                [self.process_sample(single_response, False) for single_response in response]
+            user_batch.extend(user_process)
+            response_batch.extend(response_process)
+            if ifeval:
+                batch_conversation.append((user_process, response_process))
+        if ifeval:
+            return batch_conversation
+
+        return user_batch, response_batch
     
     def create_dataset(self, data: List[Dict]) -> "EmotionContagionDataset":
         """

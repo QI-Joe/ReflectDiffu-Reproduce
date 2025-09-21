@@ -155,54 +155,44 @@ class TrainingEvaluator:
             
         logger.info("Initializing training evaluator...")
         
-        try:
-            # 1. 创建评估器，直接复用训练模型组件
-            self.evaluator = ReflectDiffuEvaluator(
-                encoder=self.model.encoder,           # 直接复用训练模型的编码器
-                it_module=self.model.it_module,       # 直接复用Intent Twice模块
-                decoder=self.model.decoder_with_loss, # 直接复用解码器
-                device=self.model.device,             # 使用相同设备
-                bart_checkpoint=self.config.bart_checkpoint
-            )
+        # 1. 创建评估器，直接复用训练模型组件
+        self.evaluator = ReflectDiffuEvaluator(
+            encoder=self.model.encoder,           # 直接复用训练模型的编码器
+            it_module=self.model.it_module,       # 直接复用Intent Twice模块
+            decoder=self.model.decoder_with_loss, # 直接复用解码器
+            device=self.model.device,             # 使用相同设备
+            bart_checkpoint=self.config.bart_checkpoint
+        )
+        
+        # 2. 加载评估数据
+        self._load_eval_data()
+        
+        # 3. 初始化日志记录器
+        if self.config.save_results:
+            self.logger = EvaluationLogger(self.config.results_dir)
+        
+        self.initialized = True
+        logger.info("Training evaluator initialized successfully")
             
-            # 2. 加载评估数据
-            self._load_eval_data()
-            
-            # 3. 初始化日志记录器
-            if self.config.save_results:
-                self.logger = EvaluationLogger(self.config.results_dir)
-            
-            self.initialized = True
-            logger.info("Training evaluator initialized successfully")
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize training evaluator: {e}")
-            raise
     
     def _load_eval_data(self):
-        """加载评估数据"""
-        try:
-            if self.config.eval_data_path:
-                # 使用专门的评估数据
-                eval_raw_data = self.model.dp.load_data(self.config.eval_data_path)
-                logger.info(f"Loaded evaluation data from {self.config.eval_data_path}")
-            else:
-                # 复用训练数据作为评估数据
-                eval_raw_data = self.model.raw_data
-                logger.info("Using training data for evaluation")
+        if self.config.eval_data_path:
+            # 使用专门的评估数据
+            eval_raw_data = self.model.dp.load_data(self.config.eval_data_path)
+            logger.info(f"Loaded evaluation data from {self.config.eval_data_path}")
+        else:
+            # 复用训练数据作为评估数据
+            eval_raw_data = self.model.raw_data
+            logger.info("Using training data for evaluation")
+        
+        # 准备评估样本
+        self.eval_data = self.evaluator.prepare_evaluation_data(
+            eval_raw_data, 
+            batch_size=self.config.max_eval_samples
+        )
+        
+        logger.info(f"Prepared {len(self.eval_data)} evaluation samples")
             
-            # 准备评估样本
-            self.eval_data = self.evaluator.prepare_evaluation_data(
-                eval_raw_data, 
-                batch_size=self.config.max_eval_samples
-            )
-            
-            logger.info(f"Prepared {len(self.eval_data)} evaluation samples")
-            
-        except Exception as e:
-            logger.error(f"Failed to load evaluation data: {e}")
-            # 创建空的评估数据以避免程序崩溃
-            self.eval_data = []
     
     def should_evaluate(self, epoch: int, step: Optional[int] = None) -> bool:
         """判断是否应该进行评估"""

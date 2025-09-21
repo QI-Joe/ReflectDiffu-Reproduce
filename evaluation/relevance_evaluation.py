@@ -5,7 +5,16 @@ import logging
 from dataclasses import dataclass
 import json
 import time
+import os
 from pathlib import Path
+import pickle
+from src.emotion_contagion.data_processor import EmotionContagionDataProcessor
+from portable_inference import temp_load_intent
+
+from src.emotion_contagion.encoder import EmotionContagionEncoder
+from src.intent_twice.intent_twice_integration import IntentTwiceModule
+from src.intent_twice.EMU import EMUConfig, EMU
+from src.intent_twice.response_decoder import PaperCompliantDecoderWithLoss
 
 from sacrebleu.metrics import BLEU
 SACREBLEU_AVAILABLE = True
@@ -23,11 +32,11 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class EvaluationSample:
-    """Single evaluation sample containing context and gold response."""
-    context_tokens: List[str]
-    gold_resp_tokens: List[str]
-    label_ids: List[int]
-    attention_mask: List[int]
+    """Single evaluation sample containing user input and target response for generation."""
+    user_tokens: List[str]  # User input tokens
+    user_label_ids: List[int]  # User input emotion labels
+    user_attention_mask: List[int]  # User input attention mask
+    response_tokens: List[str]  # Target response tokens for comparison
     h_tilde: Optional[torch.Tensor] = None
     p_intent: Optional[List[float]] = None
 
@@ -121,8 +130,9 @@ class TextProcessor:
 
 class InferenceEngine:
     """Handles autoregressive inference for response generation."""
-    
-    def __init__(self, encoder, it_module, decoder, text_processor: TextProcessor, device: torch.device):
+
+    def __init__(self, encoder: EmotionContagionEncoder, it_module: IntentTwiceModule, decoder: PaperCompliantDecoderWithLoss, \
+        text_processor: TextProcessor, device: torch.device):
         self.encoder = encoder
         self.it_module = it_module
         self.decoder = decoder
@@ -159,9 +169,9 @@ class InferenceEngine:
         """
         # 1. Emotion Contagion Encoder
         enc_out = self.encoder.forward(
-            tokens=[sample.context_tokens],
-            label_ids=torch.tensor([sample.label_ids], dtype=torch.long, device=self.device),
-            attention_mask=torch.tensor([sample.attention_mask], dtype=torch.long, device=self.device),
+            tokens=[sample.user_tokens],
+            label_ids=torch.tensor([sample.user_label_ids], dtype=torch.long, device=self.device),
+            attention_mask=torch.tensor([sample.user_attention_mask], dtype=torch.long, device=self.device),
             h_tilde=sample.h_tilde
         )
         
@@ -173,7 +183,7 @@ class InferenceEngine:
         
         it_out = self.it_module.forward(
             encoder_out=enc_out, 
-            intent_out={"p_intent": [sample.p_intent] if sample.p_intent else [[0.1] * 9]}
+            intent_out={"p_intent": sample.p_intent}
         )
         
         Emofused = it_out["Emofused"]  # [1, D] or [1, L_emof, D]
@@ -183,7 +193,7 @@ class InferenceEngine:
         # 3. Prepare source token IDs for pointer-generator
         if use_pointer:
             src_ids = torch.tensor(
-                [self.text_processor.tokens_to_ids(sample.context_tokens)], 
+                [self.text_processor.tokens_to_ids(sample.user_tokens)], 
                 device=self.device, dtype=torch.long
             )
             L_emof = Emofused.size(1)
@@ -200,27 +210,14 @@ class InferenceEngine:
         finished = torch.zeros(1, dtype=torch.bool, device=self.device)
         
         for step in range(max_len):
-            # Forward through decoder (without loss computation)
-            if hasattr(self.decoder, 'decoder'):
-                # If using DecoderWithLoss wrapper
-                out = self.decoder.decoder(
-                    trg_input_ids=ys,
-                    emofused=Emofused,
-                    src_token_ids=src_ids,
-                    tgt_key_padding_mask=None,
-                    emofused_key_padding_mask=None,
-                    extended_vocab_size=None
-                )
-            else:
-                # Direct decoder
-                out = self.decoder(
-                    trg_input_ids=ys,
-                    emofused=Emofused,
-                    src_token_ids=src_ids,
-                    tgt_key_padding_mask=None,
-                    emofused_key_padding_mask=None,
-                    extended_vocab_size=None
-                )
+            out = self.decoder.decoder(
+                trg_input_ids=ys,
+                emofused=Emofused,
+                src_token_ids=src_ids,
+                tgt_key_padding_mask=None,
+                emofused_key_padding_mask=None,
+                extended_vocab_size=None
+            )
             
             # Get probability distribution for last position
             Pw_last = out["Pw"][:, -1, :]  # [1, V]
@@ -300,7 +297,7 @@ class InferenceEngine:
             
             # Convert to text
             hyp_text = self.text_processor.ids_to_text(hyp_ids)
-            ref_ids = self.text_processor.tokens_to_ids(sample.gold_resp_tokens)
+            ref_ids = self.text_processor.tokens_to_ids(sample.response_tokens)
             ref_text = self.text_processor.ids_to_text(ref_ids)
             
             hyps.append(hyp_text)
@@ -432,63 +429,78 @@ class ReflectDiffuEvaluator:
         
         logger.info(f"ReflectDiffuEvaluator initialized on device: {device}")
     
-    def prepare_evaluation_data(self, raw_data: List, batch_size: int = None) -> List[EvaluationSample]:
+    def prepare_evaluation_data(self, raw_data: List = None, batch_size: int = None, 
+                               test_data_path: str = "dataset/emotion_labels_test.pkl") -> List[EvaluationSample]:
         """
-        Prepare evaluation data from raw_data format.
-        
-        Args:
-            raw_data: Raw data in the format used by EmotionContagionDataProcessor
-            batch_size: Optional batch size limit
+        Prepare evaluation data from conversational format.
             
         Returns:
             List of EvaluationSample objects
         """
-        from src.emotion_contagion.data_processor import EmotionContagionDataProcessor
-        from portable_inference import temp_load_intent
-        
         # Process data in pairs: user=even indices, response=odd indices
         eval_samples = []
         dp = EmotionContagionDataProcessor(max_length=64)
+        raw_data = dp.load_data(test_data_path)
+        # self.batch_data = dp.process_batch(raw_data, ifeval=True)
+        
         
         # Load intent predictions
         p_intent_full = temp_load_intent()
+        intent_idx = 0
         
-        for i in range(0, len(raw_data) - 1, 2):
-            if batch_size and len(eval_samples) >= batch_size:
-                break
+        # Process conversations: each conversation is a list of (token, label) tuples
+        # We expect alternating user-response pairs within each conversation
+        for conv_idx, conv in enumerate(raw_data):
+            user, response = conv
+            min_len = min(len(user), len(response))
+
+            for i in range(0, min_len):
+
+                user_item = user[i]      # User utterance
+                response_item = response[i]  # System response
                 
-            try:
-                user_sample = raw_data[i]      # Context/user utterance
-                resp_sample = raw_data[i + 1]  # Gold response
+                # Extract tokens and labels
+                user_tokens, user_labels = zip(*user_item)
+                response_tokens, response_labels = zip(*response_item)
                 
-                # Extract tokens (remove emotion labels)
-                context_tokens = [token for token, _ in user_sample]
-                gold_resp_tokens = [token for token, _ in resp_sample]
+                user_tokens = list(user_tokens)
+                user_labels = list(user_labels)
+                response_tokens = list(response_tokens)
                 
-                # Process context for encoder
-                processed_context = dp.process_single_sample({
-                    'tokens': context_tokens,
-                    'label_ids': [1 if label == '<em>' else 0 for _, label in user_sample]
-                })
+                if not user_tokens or not response_tokens:
+                    continue
+                
+                # Process user input for encoder
+                user_label_ids = [1 if label == '<em>' else 0 for label in user_labels]
+                
+                # Truncate if necessary
+                max_len = dp.max_length
+                if len(user_tokens) > max_len:
+                    user_tokens = user_tokens[:max_len]
+                    user_label_ids = user_label_ids[:max_len]
+                
+                # Create attention mask
+                seq_len = len(user_tokens)
+                user_attention_mask = [1] * seq_len + [0] * (max_len - seq_len)
+                user_tokens += ["[PAD]"] * (max_len - seq_len)  # Pad to max_length
+                
+                # Pad to max_length
+                user_label_ids = user_label_ids + [0] * (max_len - len(user_label_ids))
                 
                 # Get intent prediction if available
-                intent_idx = min(i // 2, len(p_intent_full) - 1)
-                p_intent = p_intent_full[intent_idx] if p_intent_full else [0.1] * 9
+                p_intent = p_intent_full[intent_idx % len(p_intent_full)]
+                intent_idx += 1
                 
                 eval_sample = EvaluationSample(
-                    context_tokens=context_tokens,
-                    gold_resp_tokens=gold_resp_tokens,
-                    label_ids=processed_context['label_ids'],
-                    attention_mask=processed_context['attention_mask'],
+                    user_tokens=user_tokens,
+                    user_label_ids=user_label_ids,
+                    user_attention_mask=user_attention_mask,
+                    response_tokens=response_tokens,
                     h_tilde=None,  # ERA placeholder
                     p_intent=p_intent
                 )
                 
                 eval_samples.append(eval_sample)
-                
-            except Exception as e:
-                logger.warning(f"Failed to process sample {i}: {e}")
-                continue
         
         logger.info(f"Prepared {len(eval_samples)} evaluation samples")
         return eval_samples
@@ -672,7 +684,7 @@ class EvaluationConfig:
     compute_bart_score: bool = True
     bart_checkpoint: str = "facebook/bart-large-cnn"
     save_results: bool = True
-    results_dir: str = "evaluation_results"
+    results_dir: str = "output"
     log_examples: bool = True
     num_examples: int = 5
     eval_batch_size: int = 1
@@ -721,57 +733,30 @@ class TrainingEvaluator:
     
     def initialize(self):
         """Initialize the evaluator and prepare evaluation data."""
-        try:
-            # Create evaluator
-            self.evaluator = ReflectDiffuEvaluator(
-                encoder=self.model.emotion_contagion_encoder,
-                it_module=self.model.intent_twice_module,
-                decoder=self.model.response_decoder,
-                device=self.model.device,
-                bart_checkpoint=self.config.bart_checkpoint
-            )
-            
-            # Prepare evaluation data
-            if self.config.eval_data_path:
-                # Load specific evaluation data
-                eval_data_path = Path(self.config.eval_data_path)
-                if eval_data_path.exists():
-                    import pickle
-                    with open(eval_data_path, 'rb') as f:
-                        raw_eval_data = pickle.load(f)
-                else:
-                    logger.warning(f"Eval data path {eval_data_path} not found, using training data")
-                    raw_eval_data = self.model.emotion_contagion_encoder.data_processor.data
-            else:
-                # Use training data
-                raw_eval_data = self.model.emotion_contagion_encoder.data_processor.data
-            
-            # Prepare evaluation samples
-            self.eval_data = self.evaluator.prepare_evaluation_data(
-                raw_eval_data, 
-                batch_size=self.config.max_eval_samples
-            )
-            self.num_eval_samples = len(self.eval_data)
-            
-            logger.info(f"Evaluation initialized with {self.num_eval_samples} samples")
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize evaluator: {e}")
-            self.evaluator = None
-            self.eval_data = None
+        self.evaluator = ReflectDiffuEvaluator(
+            encoder=self.model.encoder,
+            it_module=self.model.it_module,
+            decoder=self.model.decoder_with_loss,
+            device=self.model.device,
+            bart_checkpoint=self.config.bart_checkpoint
+        )
+        
+        self.eval_data = self.evaluator.prepare_evaluation_data(
+            raw_data=None,  # Let evaluator load from test file 
+            batch_size=self.config.max_eval_samples
+        )
+        self.num_eval_samples = len(self.eval_data)
+        
+        logger.info(f"Evaluation initialized with {self.num_eval_samples} samples")
     
     def should_evaluate(self, epoch: int, step: int) -> bool:
         """
         Check if evaluation should be performed.
-        
-        Args:
-            epoch: Current epoch number
-            step: Current step number
-            
         Returns:
             True if evaluation should be performed
         """
         if not self.evaluator or not self.eval_data:
+            
             return False
         
         # Check step-based evaluation
@@ -797,33 +782,27 @@ class TrainingEvaluator:
             logger.warning("Evaluator or eval data not available")
             return None
         
-        try:
-            # Run evaluation
-            results = self.evaluator.evaluate(
-                eval_samples=self.eval_data,
-                max_len=self.config.max_gen_length,
-                use_pointer=self.config.use_pointer,
-                batch_size_metrics=self.config.eval_batch_size,
-                temperature=self.config.temperature,
-                top_k=self.config.top_k,
-                top_p=self.config.top_p
-            )
-            
-            # Update best scores
-            if results.bleu_4 > self.best_bleu4:
-                self.best_bleu4 = results.bleu_4
-            
-            if results.bart_score > self.best_bart_score:
-                self.best_bart_score = results.bart_score
-            
-            # Add to history
-            self.evaluation_history.append(results)
-            
-            return results
-            
-        except Exception as e:
-            logger.error(f"Evaluation failed: {e}")
-            return None
+        results = self.evaluator.evaluate(
+            eval_samples=self.eval_data,
+            max_len=self.config.max_gen_length,
+            use_pointer=self.config.use_pointer,
+            batch_size_metrics=self.config.eval_batch_size,
+            temperature=self.config.temperature,
+            top_k=self.config.top_k,
+            top_p=self.config.top_p
+        )
+        
+        # Update best scores
+        if results.bleu_4 > self.best_bleu4:
+            self.best_bleu4 = results.bleu_4
+        
+        if results.bart_score > self.best_bart_score:
+            self.best_bart_score = results.bart_score
+        
+        # Add to history
+        self.evaluation_history.append(results)
+        
+        return results
     
     def log_results(self, results: EvaluationResults, epoch: int, step: int):
         """
