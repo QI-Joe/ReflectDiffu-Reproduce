@@ -8,6 +8,7 @@ class EMUConfig:
     def __init__(self, 
         hidden_dim: int,      # D
         intent_vocab_size: int,  # C = 32
+        emotion_vocab_size: int = 32,
         diffusion_steps: int = 20,
         beta_start: float = 1e-4,
         beta_end: float = 5e-2,
@@ -78,10 +79,10 @@ class EMU(nn.Module):
         self.neg_cvae = IntentAwareCVAE(cfg.D, cfg.K)
 
         # 预计算beta schedule
-        self.betas = torch.linspace(cfg.beta_start, cfg.beta_end, cfg.T)
-        alphas = 1.0 - self.betas
+        betas = torch.linspace(cfg.beta_start, cfg.beta_end, cfg.T)
+        alphas = 1.0 - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
-        self.register_buffer("betas", self.betas)  # [T]
+        self.register_buffer("betas", betas)  # [T]
         self.register_buffer("alphas_cumprod", alphas_cumprod)  # [T]
         
         self.attn_pos = nn.MultiheadAttention(cfg.D, cfg.n_heads, batch_first=True)

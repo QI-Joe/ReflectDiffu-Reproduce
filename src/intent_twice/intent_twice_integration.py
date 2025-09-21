@@ -28,7 +28,8 @@ class IntentTwiceConfig:
         policy_hidden: int = 512,
         tau: float = 1.0,
         beta_start: float = 1e-4,
-        beta_end: float = 5e-2
+        beta_end: float = 5e-2,
+        alpha: float = 0.5
     ):
         self.model_dim = model_dim
         self.emotion_dim = emotion_dim
@@ -39,7 +40,7 @@ class IntentTwiceConfig:
         self.tau = tau
         self.beta_start = beta_start
         self.beta_end = beta_end
-
+        self.alpha = alpha
 
 class EmotionMappings:
     """
@@ -198,13 +199,9 @@ class IntentTwiceModule(nn.Module):
     
     def forward(
         self,
-        tokens: List[List[str]],
-        label_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        h_tilde: Optional[torch.Tensor] = None,
+        encoder_out: Dict[str, torch.Tensor],
+        intent_out: Dict[str, torch.Tensor],
         return_components: bool = False,
-        # optionally pass/override modules here
-        encoder_module: Optional[nn.Module] = None,
         emu_module: Optional[nn.Module] = None,
         intent_policy_module: Optional[nn.Module] = None,
     ) -> Dict[str, torch.Tensor]:
@@ -228,35 +225,14 @@ class IntentTwiceModule(nn.Module):
             - chosen_intent_ids: Selected intent IDs [B]
             - monitor: Dictionary of monitoring metrics
         """
-        device = label_ids.device
-        
-        # ==================== Step 1: Emotion-Contagion Encoding ====================
-        enc = encoder_module or self.encoder_module
-        if enc is None:
-            raise ValueError("encoder_module must be provided either in __init__ or forward")
-
-        encoder_out = enc(
-            tokens=tokens,
-            label_ids=label_ids,
-            attention_mask=attention_mask,
-            h_tilde=h_tilde
-        )
-        
+        device = encoder_out["Q"].device
+               
         Q = encoder_out["Q"]  # [B, D]
         H = encoder_out["H"]  # [B, L, D]
         # P may be the Contrastive Expert output; if it already matches emotion_dim, treat as probs
-        if "p" in encoder_out:
-            p = encoder_out["p"]
-            P = encoder_out.get("P", Q)
-        else:
-            P = encoder_out.get("P", Q)  # fallback
-            # If P already [B, E], use directly; else project
-            if P.size(-1) == self.config.emotion_dim:
-                p = F.softmax(P, dim=-1)
-            else:
-                if not hasattr(self, 'emotion_classifier'):
-                    self.emotion_classifier = nn.Linear(self.config.model_dim, self.config.emotion_dim).to(device)
-                p = F.softmax(self.emotion_classifier(P), dim=-1)  # [B, E]
+        p_semantic = encoder_out["P_semantic"].to(device)  # [B, intent_dim]
+        p_intent = intent_out["p_intent"]
+        p = p_semantic + self.config.alpha * p_intent  # [B, intent_dim == 9]
         
         # ==================== Step 2: Compute Masks and Groups ====================
         group_ids, is_pos_mask = self.compute_masks_and_groups(p)
@@ -337,7 +313,6 @@ class IntentTwiceModule(nn.Module):
         if return_components:
             results.update({
                 "H": H,
-                "P": P,
                 "Emopos": Emopos,
                 "Emoneg": Emoneg,
                 "policy_logits": policy_out["logits"],

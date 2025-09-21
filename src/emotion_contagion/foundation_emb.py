@@ -112,3 +112,47 @@ class ReasonEmbedding(nn.Module):
             Reason embeddings [B, L, D]
         """
         return self.embedding(label_ids)
+
+class IntentSemanticScorer(nn.Module):
+    """
+    用可学习的意图原型/嵌入 E_intent ∈ [9, D] 与 Q ∈ [B, D] 做相似度，得到 psemantic ∈ [B, 9]。
+    可选：一个线性层将 Q 投影到 D_proj 后再算相似度（若想与 EmpHi intent_embeddings 尺寸对齐）。
+    """
+    def __init__(self, d_in: int, num_intents: int = 9, use_proj: bool = False, d_proj: int = None):
+        super().__init__()
+        self.num_intents = num_intents
+        self.use_proj = use_proj
+        if use_proj:
+            assert d_proj is not None, "d_proj 必须提供"
+            self.proj = nn.Linear(d_in, d_proj)
+            d_final = d_proj
+        else:
+            self.proj = nn.Identity()
+            d_final = d_in
+
+        # 意图原型，随机初始化；也可以从 EmpHi.intent_embeddings 拷贝初始化
+        # should nn.Embedding(9 intentions) and then insert into nn.Parameter
+        self.intent_prototypes = nn.Parameter(torch.randn(num_intents, d_final) * 0.02)
+
+    @torch.no_grad()
+    def init_from_pretrained(self, pretrained_intent_emb: torch.Tensor):
+        """
+        用外部预训练的意图嵌入初始化（例如 EmpHi 的 intent_embeddings.weight，形状 [9, D或d_proj]）
+        """
+        assert pretrained_intent_emb.shape == self.intent_prototypes.shape
+        self.intent_prototypes.copy_(pretrained_intent_emb)
+
+    def forward(self, Q: torch.Tensor) -> torch.Tensor:
+        """
+        输入:
+            Q: [B, D] Emotion-Contagion Encoder 的全局表示
+        输出:
+            psemantic: [B, 9] 在线意图语义分布
+        """
+        Qp = self.proj(Q)                      # [B, Df]
+        Qn = F.normalize(Qp, dim=-1)           # 归一化
+        En = F.normalize(self.intent_prototypes, dim=-1)  # [9, Df]
+        sims = torch.matmul(Qn, En.t())        # [B, 9]
+        psemantic = F.softmax(sims, dim=-1)    # [B, 9]
+        return psemantic, sims  # 返回相似度便于调试
+    

@@ -218,3 +218,6 @@ test_cache/
 *.ipynb
 *.pkl
 data/
+temp/
+demo_evaluation.py
+pre-trained/

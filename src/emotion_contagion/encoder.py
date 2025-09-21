@@ -258,10 +258,12 @@ class EmotionContagionEncoder(nn.Module):
         # Word embeddings
         EW = self.word_embedding(tokens)  # [B, L, D_emb]
         EW = self.word_projection(EW)     # [B, L, D]
+        EW = EW.to(device)  # Ensure on correct device
         
         # Position embeddings
         if isinstance(self.position_embedding, SinusoidalPositionalEncoding):
             EP = self.position_embedding(seq_len).unsqueeze(0).expand(batch_size, -1, -1)  # [B, L, D]
+            EP = EP.to(device)  # Ensure on correct device
         else:
             positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
             EP = self.position_embedding(positions)  # [B, L, D]
@@ -269,7 +271,7 @@ class EmotionContagionEncoder(nn.Module):
         # Reason embeddings
         ER = self.reason_embedding(label_ids)  # [B, L, D]
         
-        # Combine embeddings
+        # Combine embeddings (all tensors now on same device)
         EC = EW + EP + ER  # [B, L, D]
         
         # ==================== Step 2: H = TRSEnc(EC) ====================
