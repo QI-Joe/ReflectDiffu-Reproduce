@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import pickle
 from src.emotion_contagion.data_processor import EmotionContagionDataProcessor
-from portable_inference import temp_load_intent
+from portable_inference import build_agent, get_intent_distribution
 
 from src.emotion_contagion.encoder import EmotionContagionEncoder
 from src.intent_twice.intent_twice_integration import IntentTwiceModule
@@ -445,7 +445,9 @@ class ReflectDiffuEvaluator:
         
         
         # Load intent predictions
-        p_intent_full = temp_load_intent()
+        model_path = os.path.join(os.path.dirname(__file__), 'pre-trained', 'model', 'model')
+        self.agent = build_agent(model_path)
+        
         intent_idx = 0
         
         # Process conversations: each conversation is a list of (token, label) tuples
@@ -466,6 +468,7 @@ class ReflectDiffuEvaluator:
                 user_tokens = list(user_tokens)
                 user_labels = list(user_labels)
                 response_tokens = list(response_tokens)
+                p_intent = get_intent_distribution(self.agent, [{"origin_prompt": " ".join(user_tokens)}])[0]
                 
                 if not user_tokens or not response_tokens:
                     continue
@@ -488,7 +491,6 @@ class ReflectDiffuEvaluator:
                 user_label_ids = user_label_ids + [0] * (max_len - len(user_label_ids))
                 
                 # Get intent prediction if available
-                p_intent = p_intent_full[intent_idx % len(p_intent_full)]
                 intent_idx += 1
                 
                 eval_sample = EvaluationSample(
@@ -602,8 +604,8 @@ class ReflectDiffuEvaluator:
         """
         output_data = {
             "metrics": {
-                "BLEU-1": results.bleu_1,
-                "BLEU-2": results.bleu_2,
+                "BLEU-1": results.bleu_1 / 100,
+                "BLEU-2": results.bleu_2 / 100,
                 "BLEU-3": results.bleu_3,
                 "BLEU-4": results.bleu_4,
                 "BLEU": results.bleu_overall,

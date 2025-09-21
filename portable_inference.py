@@ -5,28 +5,25 @@ import torch.nn.functional as F
 import warnings
 import pickle
 
-# Add pretrained directory to Python path for importing agents
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'pretrained'))
+# Add pre-trained directory to Python path for importing agents
+pre_trained_path = os.path.join(os.path.dirname(__file__), 'pre-trained')
+sys.path.insert(0, pre_trained_path)
+# Also add the pre-trained directory to ensure intent_prediction can be found
+sys.path.insert(0, os.path.join(pre_trained_path))
 
-# from parlai.core.params import ParlaiParser
-# from parlai.core.agents import create_agent
+from parlai.core.params import ParlaiParser
+from parlai.core.agents import create_agent
 
 warnings.filterwarnings('ignore')
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
-class ParlaiParser:
-    def __init__(self):
-        pass
-    
-def create_agent(opt):
-    pass
 
 def build_agent(model_path):
     """Build and load the EmpHi agent with portable paths"""
     parser = ParlaiParser(add_parlai_args=True, add_model_args=True)
     parser.set_defaults(
         task='empathetic_dialogues',
-        model='pretrained.agents.emphi:EmpHi',  # Use relative import
+        model='pre-trained.agents.emphi:EmpHi',  # Use relative import
         model_file=model_path,
         dict_lower=True,
         num_layers=2,
@@ -61,7 +58,7 @@ def get_intent_distribution(agent, text_list):
     batch_lengths = []
     
     for text in text_list:
-        tokens = agent.dict.txt2vec(text)
+        tokens = agent.dict.txt2vec(text["origin_prompt"])
         batch_token_ids.append(torch.LongTensor(tokens))
         batch_lengths.append(len(tokens))
     
@@ -77,7 +74,7 @@ def get_intent_distribution(agent, text_list):
     # Move to device
     device = next(agent.model.parameters()).device
     padded_tokens = padded_tokens.to(device)
-    lengths = lengths.to(device)
+    # lengths = lengths.to(device)
     
     # Forward through encoder
     encoder_states = agent.model.encoder(padded_tokens, lengths)
@@ -94,7 +91,7 @@ def get_intent_distribution(agent, text_list):
 def demo_intent_inference():
     """Demo function showing how to use the intent inference"""
     # Portable model path relative to this script
-    model_path = os.path.join(os.path.dirname(__file__), 'pretrained', 'model', 'model')
+    model_path = os.path.join(os.path.dirname(__file__), 'pre-trained', 'model', 'model')
     
     # Build agent
     print("Loading model...")

@@ -1,0 +1,28 @@
+{
+  "meta": {
+    "run_name": "reflectdiffu_val",
+    "timestamp": "20250921-225541"
+  },
+  "relevance": {
+    "bleu_1": 12.934631432545201,
+    "bleu_2": 1.4880952380952381,
+    "bleu_3": 0.64,
+    "bleu_4": 0.08650519031141868,
+    "bleu_overall": 0.9881462279564933,
+    "bart_score": 0.0,
+    "brevity_penalty": 0.9725669023330998,
+    "num_samples": 47,
+    "avg_hyp_length": 14.042553191489361,
+    "avg_ref_length": 14.23404255319149,
+    "generation_time": 2.2453696727752686
+  },
+  "informativeness": {
+    "perplexity": 130.056220060033,
+    "distinct_1": 0.625,
+    "distinct_2": 2.349269588313412,
+    "num_samples": 47,
+    "avg_response_length": 17.02127659574468,
+    "total_tokens": 800,
+    "valid_responses": 47
+  }
+}

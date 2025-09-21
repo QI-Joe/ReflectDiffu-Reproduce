@@ -128,19 +128,12 @@ class EmotionContagionDataProcessor:
             List of processed samples
         """
         user_batch, response_batch = list(), list()
-        batch_conversation = list()
         
-        
-        for i, sample in enumerate(samples):
-            user, response = sample
-            user_process, response_process = [self.process_sample(single_user, True) for single_user in user], \
-                [self.process_sample(single_response, False) for single_response in response]
-            user_batch.extend(user_process)
-            response_batch.extend(response_process)
-            if ifeval:
-                batch_conversation.append((user_process, response_process))
-        if ifeval:
-            return batch_conversation
+        user, response = samples
+        user_process, response_process = [self.process_sample(single_user, True) for single_user in user], \
+            [self.process_sample(single_response, False) for single_response in response]
+        user_batch.extend(user_process)
+        response_batch.extend(response_process)
 
         return user_batch, response_batch
     

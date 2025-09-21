@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from typing import Optional, List, Dict, Any
+import os
 
 # ================= Import project modules =================
 from src.emotion_contagion.data_processor import EmotionContagionDataProcessor
@@ -13,7 +14,7 @@ from src.intent_twice.EMU import EMUConfig, EMU
 from src.intent_twice.IntentPolicy import IntentPolicy
 
 from src.intent_twice.response_decoder import create_paper_compliant_decoder
-from portable_inference import temp_load_intent
+from portable_inference import temp_load_intent, build_agent, get_intent_distribution
 
 def build_emotion_contagion_encoder(vocab_size: int = 5000, model_dim: int = 128):
     """构建情感传染编码器"""
@@ -112,29 +113,45 @@ class ReflectDiffu(nn.Module):
         # Data components
         self.dp = None
         self.raw_data = None
-        self.user, self.response = list(), list()
-        self.p_intent = None
+        self.batch_size = 4
+        self.batches = []
         
     def _init_data_loader(self, data_path: str, batch_size: int = 4, max_length: int = 64):
-        """Initialize data loader and process data."""
+        """Initialize data loader and create batches."""
         print("\\n=== Initializing Data Loader ===")
+        self.batch_size = batch_size
         self.dp = EmotionContagionDataProcessor(max_length=max_length)
         self.raw_data = self.dp.load_data(data_path)
-        self.raw_data = self.raw_data[:batch_size * 2]  # Ensure pairs
-        self.user, self.response = self.dp.process_batch(self.raw_data)
         
-        p_intent_full = temp_load_intent()
-        self.p_intent = p_intent_full[:len(self.user)]
-
-        # Update vocab size based on data from user and response
-        vocab_tokens = set()
-        for sample in self.user:
-            vocab_tokens.update(tok for tok in sample['tokens'] if tok != '[PAD]')
-        for sample in self.response:
-            vocab_tokens.update(tok for tok in sample['tokens'] if tok != '[PAD]')
+        # Process all data first to get vocab size
+        model_path = os.path.join(os.path.dirname(__file__), 'pre-trained', 'model', 'model')
+        self.agent = build_agent(model_path)
         
-        self.vocab_size = max(len(vocab_tokens) + 20, 100)  # Add buffer for special tokens
-        print(f"Data loaded: {len(self.user)} user samples, {len(self.response)} response samples, vocab size: {self.vocab_size}")
+        # Update vocab size based on all data
+        self.vocab_tokens = set()
+        def update_vocab(samples):
+            for sample in samples:
+                self.vocab_tokens.update(tok for tok in sample['tokens'] if tok != '[PAD]')
+        
+        # Create batches
+        self.batches = []
+        total_samples = len(self.raw_data)
+        for i in range(0, total_samples):
+            single_conv = self.raw_data[i]
+            batch_user, batch_response = self.dp.process_batch(single_conv)
+            batch_p_intent = get_intent_distribution(self.agent, batch_user)
+            
+            update_vocab(batch_user)
+            update_vocab(batch_response)
+            
+            self.batches.append({
+                'user': batch_user,
+                'response': batch_response,
+                'p_intent': batch_p_intent
+            })
+        self.vocab_size = max(len(self.vocab_tokens) + 20, 100)  
+        print(f"Data loaded: {total_samples} total samples, {len(self.batches)} batches, vocab size: {self.vocab_size}")
+        return self.batches
         
     def _init_encoder(self):
         """Initialize emotion contagion encoder."""
@@ -143,14 +160,7 @@ class ReflectDiffu(nn.Module):
             vocab_size=self.vocab_size, model_dim=self.model_dim
         ).to(self.device)
         
-        # Build vocabulary from user and response data
-        all_tokens = []
-        for sample in self.user:
-            all_tokens.extend(sample['tokens'])
-        for sample in self.response:
-            all_tokens.extend(sample['tokens'])
-        
-        self.encoder.word_embedding.build_vocab([all_tokens])
+        self.encoder.word_embedding.build_vocab([self.vocab_tokens])
         
         # Initialize emotion classifier
         self.emotion_cls = EmotionClassifier(
@@ -192,27 +202,36 @@ class ReflectDiffu(nn.Module):
             coverage_weight=self.coverage_weight
         ).to(self.device)
         
-    def _prepare_batch_data(self):
+    def _prepare_batch_data(self, batch_data=None):
         """Prepare batch data for training."""
-        # Prepare encoder inputs from self.user
-        tokens = [s['tokens'] for s in self.user]
-        label_ids = torch.tensor([s['label_ids'] for s in self.user], 
+        if batch_data is None:
+            # Use first batch for compatibility
+            batch_data = self.batches[0] if self.batches else {'user': [], 'response': [], 'p_intent': []}
+        
+        user_data = batch_data['user']
+        response_data = batch_data['response']
+        p_intent_data = batch_data['p_intent']
+        
+        # Prepare encoder inputs from user data
+        tokens = [s['tokens'] for s in user_data]
+        label_ids = torch.tensor([s['label_ids'] for s in user_data], 
                                 dtype=torch.long, device=self.device)
-        attention_mask = torch.tensor([s['attention_mask'] for s in self.user], 
+        attention_mask = torch.tensor([s['attention_mask'] for s in user_data], 
                                      dtype=torch.long, device=self.device)
         
         # Prepare decoder inputs from response data
-        decoder_data = self._prepare_decoder_data()
+        decoder_data = self._prepare_decoder_data(response_data, user_data)
         
         return {
             'tokens': tokens,
             'label_ids': label_ids,
             'attention_mask': attention_mask,
             'h_tilde': None,  # ERA placeholder
+            'p_intent': p_intent_data,
             **decoder_data
         }
         
-    def _prepare_decoder_data(self):
+    def _prepare_decoder_data(self, response_data, user_data):
         """Prepare decoder input data with real response tokens."""
         # Add special tokens to vocabulary
         special_tokens = ['<bos>', '<eos>', '[PAD]']
@@ -226,8 +245,8 @@ class ReflectDiffu(nn.Module):
         eos_id = self.encoder.word_embedding.word_to_idx['<eos>']
         pad_id = self.encoder.word_embedding.word_to_idx['[PAD]']
         
-        # Extract response tokens from self.response
-        responses_tokens = [sample['tokens'] for sample in self.response]
+        # Extract response tokens from provided response data
+        responses_tokens = [sample['tokens'] for sample in response_data]
         
         # Convert to IDs and create teacher-forcing inputs
         T = 16  # target sequence length
@@ -257,7 +276,7 @@ class ReflectDiffu(nn.Module):
         # Source token IDs for pointer-generator from user data
         src_ids_from_encoder = torch.tensor(
             [[self.encoder.word_embedding.word_to_idx.get(tok, 0) for tok in s['tokens']] 
-             for s in self.user],
+             for s in user_data],
             device=self.device, dtype=torch.long
         )
         
@@ -294,19 +313,20 @@ class ReflectDiffu(nn.Module):
         Forward pass through the complete ReflectDiffu pipeline.
         
         Args:
-            batch_data: Optional pre-prepared batch data. If None, will prepare from internal data.
+            batch_data: Optional batch data dict with 'user', 'response', 'p_intent' keys.
+                       If None, will prepare from internal data.
             
         Returns:
             Dict containing all losses and intermediate outputs
         """
-        if batch_data is None:
-            batch_data = self._prepare_batch_data()
+        prepared_data = self._prepare_batch_data(batch_data)
         
         # Extract batch components
-        tokens = batch_data['tokens']
-        label_ids = batch_data['label_ids']
-        attention_mask = batch_data['attention_mask']
-        h_tilde = batch_data['h_tilde']
+        tokens = prepared_data['tokens']
+        label_ids = prepared_data['label_ids']
+        attention_mask = prepared_data['attention_mask']
+        h_tilde = prepared_data['h_tilde']
+        p_intent = prepared_data['p_intent']
         
         # 1. Emotion Contagion Encoder
         enc_out = self.encoder.forward(
@@ -330,7 +350,7 @@ class ReflectDiffu(nn.Module):
         
         it_out = self.it_module.forward(
             encoder_out=enc_out, 
-            intent_out={'p_intent': self.p_intent}
+            intent_out={'p_intent': p_intent}
         )
         Emofused = it_out['Emofused']
         Ltwice = it_out['Ltwice']
@@ -340,7 +360,7 @@ class ReflectDiffu(nn.Module):
             Emofused = Emofused.unsqueeze(1)
         
         # Prepare src_token_ids for pointer-generator
-        src_ids_from_encoder = batch_data['src_ids_from_encoder']
+        src_ids_from_encoder = prepared_data['src_ids_from_encoder']
         L_emof = Emofused.size(1)
         if src_ids_from_encoder.size(1) < L_emof:
             pad_cols = L_emof - src_ids_from_encoder.size(1)
@@ -351,11 +371,11 @@ class ReflectDiffu(nn.Module):
         
         # Decoder forward
         dec_out = self.decoder_with_loss.forward(
-            trg_input_ids=batch_data['trg_input_ids'],
+            trg_input_ids=prepared_data['trg_input_ids'],
             emofused=Emofused,
             src_token_ids=src_token_ids,
-            gold_ids=batch_data['gold_ids'],
-            tgt_key_padding_mask=batch_data['tgt_key_padding_mask'],
+            gold_ids=prepared_data['gold_ids'],
+            tgt_key_padding_mask=prepared_data['tgt_key_padding_mask'],
             emofused_key_padding_mask=None,
             extended_vocab_size=None,
         )
@@ -370,17 +390,22 @@ class ReflectDiffu(nn.Module):
             'P': P,
             'Emofused': Emofused,
             'decoder_output': dec_out,
-            'batch_data': batch_data
+            'batch_data': prepared_data
         }
         
     def compute_joint_loss(self, outputs, delta=1.0, zeta=1.0, eta=1.0):
         """Compute joint loss from forward outputs."""
         return delta * outputs['Lem'] + zeta * outputs['Ltwice'] + eta * outputs['Lres']
+    
+    def get_batches(self):
+        """Get the list of batches for training."""
+        return self.batches
         
     def initialize_all(self, data_path: str, batch_size: int = 4, **kwargs):
         """Convenience method to initialize all components."""
-        self._init_data_loader(data_path, batch_size, **kwargs)
+        batches = self._init_data_loader(data_path, batch_size, **kwargs)
         self._init_encoder()
         self._init_it_module()
         self._init_decoder()
         print("\\n✅ All components initialized successfully!")
+        return batches

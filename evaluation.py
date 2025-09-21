@@ -10,19 +10,6 @@ from dataclasses import dataclass
 from typing import Optional, List, Dict, Any
 import logging
 
-# ================= Import project modules =================
-from src.emotion_contagion.data_processor import EmotionContagionDataProcessor
-from src.emotion_contagion.config import EmotionContagionConfig
-from src.emotion_contagion.encoder import EmotionContagionEncoder, EmotionClassifier, ce_loss_for_emotion
-from src.emotion_contagion.foundation_emb import IntentSemanticScorer
-from src.intent_twice.intent_twice_integration import IntentTwiceConfig, IntentTwiceModule
-from src.intent_twice.EMU import EMUConfig, EMU
-from src.intent_twice.IntentPolicy import IntentPolicy
-
-# Import our new paper-compliant decoder
-from intent_twice.response_decoder import create_paper_compliant_decoder
-
-from portable_inference import temp_load_intent
 from evaluation import ReflectDiffuEvaluator, EvaluationResults, EvaluationSample
 EVALUATION_AVAILABLE = True
 
