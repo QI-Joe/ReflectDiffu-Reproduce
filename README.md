@@ -71,7 +71,7 @@ dataset/
 
 ### 2. 🧠 EmpHi Intent Prediction Setup
 
-Download the required EmpHi models and reflect-Diffu best models from Google Drive and organize as follows:
+Download the required EmpHi models and reflect-Diffu best models from [Google Drive](https://drive.google.com/drive/folders/148Ftrh_mH8y7_yOap2h9CmMXxYn4cgc0?usp=drive_link) and organize as follows:
 
 ```
 pre-trained/
