@@ -11,11 +11,18 @@ sys.path.insert(0, pre_trained_path)
 # Also add the pre-trained directory to ensure intent_prediction can be found
 sys.path.insert(0, os.path.join(pre_trained_path))
 
-from parlai.core.params import ParlaiParser
-from parlai.core.agents import create_agent
+# from parlai.core.params import ParlaiParser
+# from parlai.core.agents import create_agent
 
 warnings.filterwarnings('ignore')
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+class ParlaiParser:
+    def __init__(self):
+        pass
+    
+def create_agent(opt):
+    pass
 
 
 def build_agent(model_path):
@@ -140,10 +147,11 @@ def demo_intent_inference():
     print(f"\nIntent distribution shape: {intent_probs.shape}")
     return intent_probs
 
-def temp_load_intent():
-    with open(r"pre-trained/p_intent_1060.pkl", "rb") as f:
-        p_intent = pickle.load(f)
-    return p_intent
+def build_random_intent(text: list[str], device):
+    batch_size = len(text)
+    random_intent = torch.rand(batch_size, 9).to(device)
+    random_intent = F.softmax(random_intent, dim=-1)
+    return random_intent
 
 if __name__ == '__main__':
     pintent = demo_intent_inference()

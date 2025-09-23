@@ -9,16 +9,18 @@ import os
 from pathlib import Path
 import pickle
 from src.emotion_contagion.data_processor import EmotionContagionDataProcessor
-from portable_inference import build_agent, get_intent_distribution
-
+from portable_inference import build_random_intent
 from src.emotion_contagion.encoder import EmotionContagionEncoder
 from src.intent_twice.intent_twice_integration import IntentTwiceModule
 from src.intent_twice.EMU import EMUConfig, EMU
 from src.intent_twice.response_decoder import PaperCompliantDecoderWithLoss
+from src.tokenizer_loader import get_tokenizer
+from evaluation.informativeness import InformativenessEvaluator
 
 from sacrebleu.metrics import BLEU
 SACREBLEU_AVAILABLE = True
 EVALUATION_AVAILABLE = True
+TOKENIZER = get_tokenizer()
 
 try:
     from bart_score import BARTScorer
@@ -33,10 +35,12 @@ logger = logging.getLogger(__name__)
 @dataclass
 class EvaluationSample:
     """Single evaluation sample containing user input and target response for generation."""
-    user_tokens: List[str]  # User input tokens
-    user_label_ids: List[int]  # User input emotion labels
-    user_attention_mask: List[int]  # User input attention mask
-    response_tokens: List[str]  # Target response tokens for comparison
+    user_tokens: List[str]  # User input tokens (unpadded, truncated to max_length)
+    user_input_ids: List[int]  # Tokenizer-encoded input ids (length = max_length)
+    user_label_ids: List[int]  # User input emotion labels (padded to max_length)
+    user_attention_mask: List[int]  # Attention mask from tokenizer (length = max_length)
+    response_tokens: List[str]  # Target response tokens (raw tokens, no manual padding)
+    response_input_ids: Optional[List[int]] = None  # Tokenizer ids for reference response (no extra special tokens, truncated)
     h_tilde: Optional[torch.Tensor] = None
     p_intent: Optional[List[float]] = None
 
@@ -168,8 +172,9 @@ class InferenceEngine:
             Generated token IDs (without <bos> and <eos>)
         """
         # 1. Emotion Contagion Encoder
+        tokens = torch.tensor([sample.user_input_ids], dtype=torch.long, device=self.device)
         enc_out = self.encoder.forward(
-            tokens=[sample.user_tokens],
+            tokens=tokens,
             label_ids=torch.tensor([sample.user_label_ids], dtype=torch.long, device=self.device),
             attention_mask=torch.tensor([sample.user_attention_mask], dtype=torch.long, device=self.device),
             h_tilde=sample.h_tilde
@@ -206,9 +211,13 @@ class InferenceEngine:
             src_ids = torch.zeros((1, Emofused.size(1)), device=self.device, dtype=torch.long)
         
         # 4. Autoregressive generation
-        ys = torch.full((1, 1), self.text_processor.bos_id, device=self.device, dtype=torch.long)
+        # Use central TOKENIZER BOS/EOS for generation (preferred). Falls back to legacy TextProcessor IDs
+        # if tokenizer lacks cls/sep definitions. This keeps backward compatibility while unifying paths.
+        bos_id = TOKENIZER.cls_token_id if TOKENIZER.cls_token_id is not None else self.text_processor.bos_id
+        eos_id = TOKENIZER.sep_token_id if TOKENIZER.sep_token_id is not None else self.text_processor.eos_id
+        ys = torch.full((1, 1), bos_id, device=self.device, dtype=torch.long)
         finished = torch.zeros(1, dtype=torch.bool, device=self.device)
-        
+
         for step in range(max_len):
             out = self.decoder.decoder(
                 trg_input_ids=ys,
@@ -218,21 +227,21 @@ class InferenceEngine:
                 emofused_key_padding_mask=None,
                 extended_vocab_size=None
             )
-            
+
             # Get probability distribution for last position
             Pw_last = out["Pw"][:, -1, :]  # [1, V]
-            
+
             # Apply temperature scaling
             if temperature != 1.0:
                 Pw_last = Pw_last / temperature
-            
+
             # Apply top-k filtering
             if top_k > 0:
                 top_k_vals, top_k_indices = torch.topk(Pw_last, top_k, dim=-1)
                 mask = torch.full_like(Pw_last, float('-inf'))
                 mask.scatter_(1, top_k_indices, top_k_vals)
                 Pw_last = mask
-            
+
             # Apply top-p filtering
             if top_p < 1.0:
                 sorted_logits, sorted_indices = torch.sort(Pw_last, descending=True, dim=-1)
@@ -242,29 +251,29 @@ class InferenceEngine:
                 sorted_indices_to_remove[:, 0] = 0
                 indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
                 Pw_last[indices_to_remove] = float('-inf')
-            
+
             # Sample next token (greedy if temperature=1.0 and no top-k/top-p)
             if temperature == 1.0 and top_k == 0 and top_p == 1.0:
                 next_id = Pw_last.argmax(dim=-1)
             else:
                 probs = F.softmax(Pw_last, dim=-1)
                 next_id = torch.multinomial(probs, 1).squeeze(1)
-            
+
             # Append to sequence
             ys = torch.cat([ys, next_id.unsqueeze(1)], dim=1)
-            
+
             # Check for EOS
-            finished |= (next_id == self.text_processor.eos_id)
+            finished |= (next_id == eos_id)
             if bool(finished.item()):
                 break
-        
+
         # Extract generated sequence (remove <bos> and optionally <eos>)
         gen_ids = ys[0].tolist()
-        if gen_ids and gen_ids[0] == self.text_processor.bos_id:
+        if gen_ids and gen_ids[0] == bos_id:
             gen_ids = gen_ids[1:]
-        if gen_ids and gen_ids[-1] == self.text_processor.eos_id:
+        if gen_ids and gen_ids[-1] == eos_id:
             gen_ids = gen_ids[:-1]
-        
+
         return gen_ids
     
     @torch.no_grad()
@@ -289,17 +298,29 @@ class InferenceEngine:
         """
         hyps, refs = [], []
         
+        bos_id = TOKENIZER.cls_token_id if TOKENIZER.cls_token_id is not None else self.text_processor.bos_id
+        eos_id = TOKENIZER.sep_token_id if TOKENIZER.sep_token_id is not None else self.text_processor.eos_id
+
         for sample in eval_samples:
-            # Generate hypothesis
             hyp_ids = self.generate_single_response(
                 sample, max_len=max_len, use_pointer=use_pointer, **generation_kwargs
             )
-            
-            # Convert to text
-            hyp_text = self.text_processor.ids_to_text(hyp_ids)
-            ref_ids = self.text_processor.tokens_to_ids(sample.response_tokens)
-            ref_text = self.text_processor.ids_to_text(ref_ids)
-            
+            # Decode with tokenizer; ensure special tokens removed
+            hyp_text = TOKENIZER.decode(hyp_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+
+            if sample.response_input_ids is not None:
+                ref_ids = sample.response_input_ids
+            else:
+                # Fallback: encode response tokens on the fly
+                ref_text_join = " ".join(sample.response_tokens)
+                ref_ids = TOKENIZER(
+                    ref_text_join,
+                    add_special_tokens=False,
+                    truncation=True,
+                    max_length=len(hyp_ids) + 5  # heuristic buffer
+                )["input_ids"]
+            ref_text = TOKENIZER.decode(ref_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+
             hyps.append(hyp_text)
             refs.append(ref_text)
         
@@ -426,8 +447,10 @@ class ReflectDiffuEvaluator:
         self.inference_engine = InferenceEngine(encoder, it_module, decoder, self.text_processor, device)
         self.metrics_calculator = MetricsCalculator(device=str(device))
         self.bart_checkpoint = bart_checkpoint
-        
-        logger.info(f"ReflectDiffuEvaluator initialized on device: {device}")
+
+        self.pad_id = TOKENIZER.pad_token_id
+        self.bos_id = TOKENIZER.cls_token_id 
+        self.eos_id = TOKENIZER.sep_token_id
     
     def prepare_evaluation_data(self, raw_data: List = None, batch_size: int = None, 
                                test_data_path: str = "dataset/emotion_labels_test.pkl") -> List[EvaluationSample]:
@@ -446,63 +469,93 @@ class ReflectDiffuEvaluator:
         
         # Load intent predictions
         model_path = os.path.join(os.path.dirname(__file__), 'pre-trained', 'model', 'model')
-        self.agent = build_agent(model_path)
+        # self.agent = build_agent(model_path)
         
         intent_idx = 0
         
         # Process conversations: each conversation is a list of (token, label) tuples
         # We expect alternating user-response pairs within each conversation
         for conv_idx, conv in enumerate(raw_data):
-            user, response = conv
-            min_len = min(len(user), len(response))
+            if not isinstance(conv, (list, tuple)) or len(conv) != 2:
+                continue  # Skip malformed entries
+            user_list, response_list = conv
+            min_len = min(len(user_list), len(response_list))
 
-            for i in range(0, min_len):
+            for i in range(min_len):
+                user_item = user_list[i]
+                response_item = response_list[i]
 
-                user_item = user[i]      # User utterance
-                response_item = response[i]  # System response
-                
-                # Extract tokens and labels
-                user_tokens, user_labels = zip(*user_item)
-                response_tokens, response_labels = zip(*response_item)
-                
-                user_tokens = list(user_tokens)
-                user_labels = list(user_labels)
-                response_tokens = list(response_tokens)
-                p_intent = get_intent_distribution(self.agent, [{"origin_prompt": " ".join(user_tokens)}])[0]
-                
+                if not user_item or not response_item:
+                    continue
+
+                # Each item is a list of (token, label) tuples
+                try:
+                    user_tokens_raw, user_labels_raw = zip(*user_item)
+                    response_tokens_raw, _ = zip(*response_item)
+                except ValueError:
+                    # Skip if structure unexpected
+                    continue
+
+                user_tokens = list(user_tokens_raw)
+                response_tokens = list(response_tokens_raw)
+                user_label_ids = [1 if l == '<em>' else 0 for l in user_labels_raw]
+
                 if not user_tokens or not response_tokens:
                     continue
-                
-                # Process user input for encoder
-                user_label_ids = [1 if label == '<em>' else 0 for label in user_labels]
-                
-                # Truncate if necessary
+
                 max_len = dp.max_length
+                # Truncate tokens & labels together
                 if len(user_tokens) > max_len:
                     user_tokens = user_tokens[:max_len]
                     user_label_ids = user_label_ids[:max_len]
-                
-                # Create attention mask
-                seq_len = len(user_tokens)
-                user_attention_mask = [1] * seq_len + [0] * (max_len - seq_len)
-                user_tokens += ["[PAD]"] * (max_len - seq_len)  # Pad to max_length
-                
-                # Pad to max_length
-                user_label_ids = user_label_ids + [0] * (max_len - len(user_label_ids))
-                
-                # Get intent prediction if available
-                intent_idx += 1
-                
-                eval_sample = EvaluationSample(
-                    user_tokens=user_tokens,
-                    user_label_ids=user_label_ids,
-                    user_attention_mask=user_attention_mask,
-                    response_tokens=response_tokens,
-                    h_tilde=None,  # ERA placeholder
-                    p_intent=p_intent
+
+                # Encode with tokenizer (let tokenizer handle padding to max_length)
+                user_text = " ".join(user_tokens)
+                encoded = TOKENIZER(
+                    user_text,
+                    padding='max_length',
+                    truncation=True,
+                    max_length=max_len,
+                    return_tensors='pt'
                 )
-                
-                eval_samples.append(eval_sample)
+                user_input_ids = encoded['input_ids'][0].tolist()
+                user_attention_mask = encoded['attention_mask'][0].tolist()
+
+                # Pad emotion labels to max_len (independent of wordpiece expansion)
+                if len(user_label_ids) < max_len:
+                    user_label_ids = user_label_ids + [0] * (max_len - len(user_label_ids))
+                else:
+                    user_label_ids = user_label_ids[:max_len]
+
+                # Intent prediction (random placeholder)
+                p_intent = build_random_intent([user_text], self.device)
+                intent_idx += 1
+
+                # Encode reference response for consistent decoding metrics (avoid adding BOS/EOS twice)
+                response_text = " ".join(response_tokens)
+                # We don't force max_length padding for reference; just truncate to max_len to be comparable
+                resp_encoded = TOKENIZER(
+                    response_text,
+                    padding=False,
+                    truncation=True,
+                    max_length=max_len,
+                    add_special_tokens=False,
+                    return_tensors='pt'
+                )
+                response_input_ids = resp_encoded['input_ids'][0].tolist()
+
+                eval_samples.append(
+                    EvaluationSample(
+                        user_tokens=user_tokens,  # original (possibly truncated) tokens
+                        user_input_ids=user_input_ids,
+                        user_label_ids=user_label_ids,
+                        user_attention_mask=user_attention_mask,
+                        response_tokens=response_tokens,
+                        response_input_ids=response_input_ids,
+                        h_tilde=None,
+                        p_intent=p_intent
+                    )
+                )
         
         logger.info(f"Prepared {len(eval_samples)} evaluation samples")
         return eval_samples
@@ -580,11 +633,6 @@ class ReflectDiffuEvaluator:
     ) -> EvaluationResults:
         """
         Convenience method to evaluate directly from raw data.
-        
-        Args:
-            raw_data: Raw data in EmotionContagionDataProcessor format
-            max_samples: Maximum number of samples to evaluate
-            **evaluation_kwargs: Arguments passed to evaluate()
             
         Returns:
             EvaluationResults object
@@ -684,6 +732,7 @@ class EvaluationConfig:
     top_p: float = 1.0
     compute_bleu: bool = True
     compute_bart_score: bool = True
+    compute_informativeness: bool = True  # when True, also compute perplexity & distinct
     bart_checkpoint: str = "facebook/bart-large-cnn"
     save_results: bool = True
     results_dir: str = "output"
@@ -719,7 +768,9 @@ class TrainingEvaluator:
         
         # Tracking
         self.best_bleu4 = 0.0
+        # Track best bart score (maximize) and best perplexity (minimize)
         self.best_bart_score = float('-inf')
+        self.best_perplexity = None  # will be set after first informativeness evaluation
         self.evaluation_history = []
         self.num_eval_samples = 0
         
@@ -741,6 +792,13 @@ class TrainingEvaluator:
             decoder=self.model.decoder_with_loss,
             device=self.model.device,
             bart_checkpoint=self.config.bart_checkpoint
+        )
+        
+        self.evaluator_inform = InformativenessEvaluator(
+            encoder=self.model.encoder,
+            it_module=self.model.it_module,
+            decoder=self.model.decoder_with_loss,
+            device=self.model.device
         )
         
         self.eval_data = self.evaluator.prepare_evaluation_data(
@@ -773,7 +831,7 @@ class TrainingEvaluator:
         
         return False
     
-    def evaluate(self) -> Optional[EvaluationResults]:
+    def evaluate(self) -> Optional[Tuple[EvaluationResults, Optional[Any]]]:
         """
         Run evaluation and return results.
         
@@ -784,7 +842,7 @@ class TrainingEvaluator:
             logger.warning("Evaluator or eval data not available")
             return None
         
-        results = self.evaluator.evaluate(
+        relevance_results = self.evaluator.evaluate(
             eval_samples=self.eval_data,
             max_len=self.config.max_gen_length,
             use_pointer=self.config.use_pointer,
@@ -793,20 +851,29 @@ class TrainingEvaluator:
             top_k=self.config.top_k,
             top_p=self.config.top_p
         )
-        
-        # Update best scores
-        if results.bleu_4 > self.best_bleu4:
-            self.best_bleu4 = results.bleu_4
-        
-        if results.bart_score > self.best_bart_score:
-            self.best_bart_score = results.bart_score
-        
-        # Add to history
-        self.evaluation_history.append(results)
-        
-        return results
+        info_results = None
+        if self.config.compute_informativeness:
+            info_results = self.evaluator_inform.evaluate_from_file(
+                data_path=self.config.eval_data_path or 'dataset/emotion_labels_test.pkl',
+                max_samples=self.config.max_eval_samples
+            )
+            self.last_informativeness = info_results
+
+        # Update best metrics (maximize BLEU-4, minimize perplexity)
+        if relevance_results.bleu_4 > self.best_bleu4:
+            self.best_bleu4 = relevance_results.bleu_4
+        # Track best bart score if available
+        if info_results is not None:
+            if not hasattr(self, 'best_perplexity') or self.best_perplexity is None:
+                self.best_perplexity = info_results.perplexity
+            else:
+                if info_results.perplexity < self.best_perplexity:
+                    self.best_perplexity = info_results.perplexity
+
+        self.evaluation_history.append(relevance_results)
+        return relevance_results, info_results
     
-    def log_results(self, results: EvaluationResults, epoch: int, step: int):
+    def log_results(self, relevance_results: EvaluationResults, info_results: Optional[Any], epoch: int, step: int):
         """
         Log evaluation results.
         
@@ -814,13 +881,15 @@ class TrainingEvaluator:
             results: EvaluationResults object
             epoch: Current epoch
             step: Current step
+        
         """
         print(f"\n📊 Evaluation Results (Epoch {epoch}, Step {step}):")
-        print(f"  BLEU-4: {results.bleu_4:.2f}% (Best: {self.best_bleu4:.2f}%)")
-        print(f"  BLEU: {results.bleu_overall:.2f}")
-        print(f"  BARTScore: {results.bart_score:.4f} (Best: {self.best_bart_score:.4f})")
-        print(f"  Samples: {results.num_samples}")
-        print(f"  Gen Time: {results.generation_time:.2f}s")
+        print(f"  BLEU-4: {relevance_results.bleu_4:.2f}% (Best: {self.best_bleu4:.2f}%)")
+        print(f"  BLEU: {relevance_results.bleu_overall:.2f}")
+        print(f"  Samples: {relevance_results.num_samples}")
+        print(f"  Gen Time: {relevance_results.generation_time:.2f}s")
+        if info_results is not None:
+            print(f"  PPL: {info_results.perplexity:.2f} (Best: {getattr(self, 'best_perplexity', float('nan')):.2f}) | Dist-1: {info_results.distinct_1:.3f} | Dist-2: {info_results.distinct_2:.3f}")
         
         # Log examples if requested
         if self.config.log_examples and self.num_eval_samples > 0:
@@ -849,9 +918,34 @@ class TrainingEvaluator:
         if self.config.save_results:
             results_file = self.results_dir / f"eval_epoch_{epoch}_step_{step}.json"
             try:
-                self.evaluator.save_results(results, results_file)
+                payload = {
+                    'epoch': epoch,
+                    'step': step,
+                    'relevance': {
+                        'BLEU-1': relevance_results.bleu_1,
+                        'BLEU-2': relevance_results.bleu_2,
+                        'BLEU-3': relevance_results.bleu_3,
+                        'BLEU-4': relevance_results.bleu_4,
+                        'BLEU': relevance_results.bleu_overall,
+                        'BARTScore': relevance_results.bart_score,
+                        'BP': relevance_results.brevity_penalty,
+                        'avg_hyp_length': relevance_results.avg_hyp_length,
+                        'avg_ref_length': relevance_results.avg_ref_length,
+                        'generation_time': relevance_results.generation_time
+                    }
+                }
+                if info_results is not None:
+                    payload['informativeness'] = {
+                        'perplexity': info_results.perplexity,
+                        'distinct_1': info_results.distinct_1,
+                        'distinct_2': info_results.distinct_2,
+                        'avg_response_length': info_results.avg_response_length,
+                        'valid_responses': info_results.valid_responses
+                    }
+                with open(results_file, 'w', encoding='utf-8') as f:
+                    json.dump(payload, f, indent=2, ensure_ascii=False)
             except Exception as e:
-                logger.warning(f"Failed to save results: {e}")
+                logger.warning(f"Failed to save combined results: {e}")
         
         # Update tracking
         self.last_eval_epoch = epoch
@@ -867,6 +961,7 @@ class TrainingEvaluator:
         return {
             'best_bleu4': self.best_bleu4,
             'best_bart_score': self.best_bart_score,
+            'best_perplexity': self.best_perplexity,
             'num_evaluations': len(self.evaluation_history),
             'num_eval_samples': self.num_eval_samples,
             'last_eval_epoch': self.last_eval_epoch,

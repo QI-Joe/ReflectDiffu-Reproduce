@@ -160,12 +160,15 @@ class EmotionContagionEncoder(nn.Module):
     4. Q = mean-pooling(Z)
     """
     
-    def __init__(self, config: EmotionContagionConfig):
+    def __init__(self, config: EmotionContagionConfig, external_tokenizer=None):
         super().__init__()
         self.config = config
         
         # ==================== Embedding Layers ====================
         self.word_embedding = WordEmbedding(config.vocab_size, config.word_embedding_dim)
+        if external_tokenizer is not None:
+            # Attach external tokenizer and enforce ID stability
+            self.word_embedding.attach_tokenizer(external_tokenizer, enforce_external_only=True)
         
         # Projection layer if word_embedding_dim != model_dim
         if config.word_embedding_dim != config.model_dim:
@@ -222,16 +225,9 @@ class EmotionContagionEncoder(nn.Module):
             
         self.conExport = CONExpert(config.model_dim)
     
-    def build_vocab_from_data(self, data_loader):
-        """Build vocabulary from data loader."""
-        all_tokens = []
-        for batch in data_loader:
-            all_tokens.extend(batch["tokens"])
-        self.word_embedding.build_vocab(all_tokens)
-    
     def forward(
         self,
-        tokens: List[List[str]],
+        tokens: List[List[torch.Tensor]],
         label_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         h_tilde: Optional[torch.Tensor] = None
@@ -240,7 +236,7 @@ class EmotionContagionEncoder(nn.Module):
         Forward pass through emotion-contagion encoder.
         
         Args:
-            tokens: Token sequences [B, L] (list of strings)
+            tokens: Token sequences [B, L] (list of lists of token IDs)
             label_ids: Reason label IDs [B, L]
             attention_mask: Attention mask [B, L] (1 for valid, 0 for padding)
             h_tilde: ERA reasoning representation [B, L, D_era] (optional)

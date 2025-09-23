@@ -14,50 +14,58 @@ class WordEmbedding(nn.Module):
         self.vocab_size = vocab_size
         self.embedding_dim = embedding_dim
         
-        # Simple word-to-index mapping (in practice, would use pre-trained GloVe)
+        # Legacy word-to-index mapping (kept for backward compatibility if no tokenizer attached)
         self.word_to_idx = {}
         self.idx_to_word = {}
-        
-    def build_vocab(self, tokens_list: List[List[str]]):
-        """Build vocabulary from token lists."""
-        vocab = set()
-        for tokens in tokens_list:
-            vocab.update(tokens)
-        
-        # Add special tokens
-        vocab.update(["[PAD]", "[UNK]"])
-        
-        self.word_to_idx = {word: idx for idx, word in enumerate(sorted(vocab))}
-        self.idx_to_word = {idx: word for word, idx in self.word_to_idx.items()}
-        
-        # Update embedding layer if vocab size changed
-        if len(self.word_to_idx) != self.vocab_size:
-            self.vocab_size = len(self.word_to_idx)
-            self.embedding = nn.Embedding(self.vocab_size, self.embedding_dim)
-    
+        # External tokenizer reference (e.g., HuggingFace AutoTokenizer)
+        self._external_tokenizer = None
+        self._enforce_external_only = False  # when True, forbid fallback local mapping
+
+    def attach_tokenizer(self, tokenizer, enforce_external_only: bool = True):
+        """Attach an external tokenizer providing stable ids.
+
+        Args:
+            tokenizer: object with __len__, encode / __call__, pad_token_id, etc.
+            enforce_external_only: if True, disable local tokens_to_ids path to prevent id drift.
+        """
+        self._external_tokenizer = tokenizer
+        self._enforce_external_only = enforce_external_only
+        # If external tokenizer vocab size differs, resize embedding.
+        ext_size = len(tokenizer)
+        if ext_size != self.vocab_size:
+            old_weight = self.embedding.weight.data
+            self.embedding = nn.Embedding(ext_size, self.embedding_dim)
+            # Partial copy (min old,new)
+            copy_n = min(old_weight.size(0), ext_size)
+            self.embedding.weight.data[:copy_n] = old_weight[:copy_n]
+            self.vocab_size = ext_size
+         
     def tokens_to_ids(self, tokens: List[str]) -> List[int]:
         """Convert tokens to indices."""
         unk_idx = self.word_to_idx.get("[UNK]", 0)
         return [self.word_to_idx.get(token, unk_idx) for token in tokens]
     
-    def forward(self, tokens: List[List[str]]) -> torch.Tensor:
+    def forward(self, tokens) -> torch.Tensor:
         """
         Forward pass for word embeddings.
         
         Args:
-            tokens: List of token sequences [B, L]
+            tokens: Either List[List[str]] (legacy) or a LongTensor of shape [B, L]
             
         Returns:
             Word embeddings [B, L, D_emb]
         """
-        # Convert tokens to indices
-        batch_indices = []
-        for token_seq in tokens:
-            indices = self.tokens_to_ids(token_seq)
-            batch_indices.append(indices)
-        
-        # Convert to tensor
-        input_ids = torch.tensor(batch_indices, dtype=torch.long, device=self.embedding.weight.device)
+        if torch.is_tensor(tokens):
+            input_ids = tokens.to(self.embedding.weight.device)
+        else:
+            if self._external_tokenizer is not None and self._enforce_external_only:
+                raise RuntimeError("String token sequences passed to WordEmbedding while external tokenizer attached with enforce_external_only=True. Pre-tokenize upstream and pass LongTensor IDs.")
+            batch_indices = []
+            for token_seq in tokens:
+                # Legacy path (will be removed once full tokenizer migration complete)
+                indices = self.tokens_to_ids(token_seq)
+                batch_indices.append(indices)
+            input_ids = torch.tensor(batch_indices, dtype=torch.long, device=self.embedding.weight.device)
         
         return self.embedding(input_ids)
 

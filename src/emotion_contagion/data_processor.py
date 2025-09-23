@@ -24,8 +24,11 @@ import json
 import logging
 import os
 import pickle
+from src.tokenizer_loader import get_tokenizer
 
 logger = logging.getLogger(__name__)
+
+TOKENIZER = get_tokenizer()
 
 
 class EmotionContagionDataProcessor:
@@ -84,42 +87,49 @@ class EmotionContagionDataProcessor:
         Returns:
             Processed sample with aligned tokens/labels and attention mask
         """
-        # Extract tokens and labels from sentence1
-        tokens, labels = zip(*sample)
-        tokens, labels = list(tokens), list(labels)
-        
-        # Validate alignment
-        if len(tokens) != len(labels):
-            raise ValueError(
-                f"Token-label mismatch: {len(tokens)} tokens vs {len(labels)} labels"
-            )
-        
-        # Convert labels to IDs
-        label_ids = [self.label_to_id.get(label, 0) for label in labels]
-        
-        # Truncate if necessary
-        if len(tokens) > self.max_length:
-            tokens = tokens[:self.max_length]
-            label_ids = label_ids[:self.max_length]
-            labels = labels[:self.max_length]
-        
-        # Create attention mask (1 for valid tokens, 0 for padding)
-        seq_len = len(tokens)
-        attention_mask = [1] * seq_len + [0] * (self.max_length - seq_len)
-        
-        # Pad tokens and labels to max_length
-        padded_tokens = tokens + ["[PAD]"] * (self.max_length - seq_len)
-        padded_label_ids = label_ids + [0] * (self.max_length - seq_len)  # 0 = noem for padding
-        padded_labels = labels + ["noem"] * (self.max_length - seq_len)
-        
+        # Expect sample as list of (token,label) tuples
+        word_tokens, word_labels = zip(*sample)
+        word_tokens = list(word_tokens)
+        word_labels = list(word_labels)
+
+        if len(word_tokens) != len(word_labels):
+            raise ValueError(f"Token-label mismatch: {len(word_tokens)} vs {len(word_labels)}")
+
+        # Truncate at word level first (labels follow)
+        if len(word_tokens) > self.max_length:
+            word_tokens = word_tokens[:self.max_length]
+            word_labels = word_labels[:self.max_length]
+
+        # Word-level emotion label ids (no expansion to wordpieces)
+        label_ids = [self.label_to_id.get(l, 0) for l in word_labels]
+
+        # Tokenizer over the joined text; relies on HF internal wordpiece + max_length padding
+        text = " ".join(word_tokens)
+        encoded = TOKENIZER(
+            text,
+            padding='max_length',
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors='pt'
+        )
+        input_ids = encoded['input_ids'][0].tolist()
+        attention_mask = encoded['attention_mask'][0].tolist()
+
+        # Pad label_ids to max_length (labels correspond to first N original words)
+        if len(label_ids) < self.max_length:
+            label_ids = label_ids + [0] * (self.max_length - len(label_ids))
+
+        seq_len = min(len(word_tokens), self.max_length)
+
         return {
-            "tokens": padded_tokens,
-            "label_ids": padded_label_ids,
-            "labels": padded_labels,
-            "attention_mask": attention_mask,
-            "seq_len": seq_len,
-            "user": user,
-            "origin_prompt": " ".join(tokens)
+            'tokens': word_tokens[:seq_len],  # unpadded original words
+            'input_ids': input_ids,            # token ids length = max_length
+            'label_ids': label_ids,            # word-level labels padded to max_length
+            'labels': word_labels[:seq_len],   # truncated labels (no padding strings)
+            'attention_mask': attention_mask,  # tokenizer mask length = max_length
+            'seq_len': seq_len,
+            'user': user,
+            'origin_prompt': text
         }
     
     def process_batch(self, samples: List[Dict], ifeval: bool=False) -> List[Dict]:
@@ -188,16 +198,18 @@ class EmotionContagionDataProcessor:
             Batched tensors
         """
         # Stack all sequences
-        batch_tokens = [sample["tokens"] for sample in batch]
-        batch_label_ids = torch.tensor([sample["label_ids"] for sample in batch], dtype=torch.long)
-        batch_attention_mask = torch.tensor([sample["attention_mask"] for sample in batch], dtype=torch.long)
-        batch_seq_len = torch.tensor([sample["seq_len"] for sample in batch], dtype=torch.long)
-        
+        batch_tokens = [s['tokens'] for s in batch]
+        batch_input_ids = torch.tensor([s['input_ids'] for s in batch], dtype=torch.long)
+        batch_label_ids = torch.tensor([s['label_ids'] for s in batch], dtype=torch.long)
+        batch_attention_mask = torch.tensor([s['attention_mask'] for s in batch], dtype=torch.long)
+        batch_seq_len = torch.tensor([s['seq_len'] for s in batch], dtype=torch.long)
+
         return {
-            "tokens": batch_tokens,  # Keep as list of strings for word embedding lookup
-            "label_ids": batch_label_ids,  # [B, L]
-            "attention_mask": batch_attention_mask,  # [B, L]
-            "seq_len": batch_seq_len,  # [B]
+            'tokens': batch_tokens,
+            'input_ids': batch_input_ids,
+            'label_ids': batch_label_ids,
+            'attention_mask': batch_attention_mask,
+            'seq_len': batch_seq_len,
         }
 
 

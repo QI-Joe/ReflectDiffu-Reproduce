@@ -73,6 +73,7 @@ def evaluate_relevance(model, data_path: str, max_samples: int, device: torch.de
         test_data_path=data_path
     )
     
+    
     # Run evaluation
     start_time = time.time()
     results = relevance_evaluator.evaluate(

@@ -3,6 +3,7 @@ from typing import List, Dict, Optional, Literal, Tuple
 import torch
 import math
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from src.tokenizer_loader import _ids_to_text_list
 PolarityV = Literal['nneg', 'nneu', 'npos']
 
 def decide_batch_polarity_via_vader(
@@ -11,6 +12,9 @@ def decide_batch_polarity_via_vader(
     neg_thresh: float = -0.05
 ) -> Tuple[PolarityV, Dict[str, int], Dict[str, float]]:
     analyzer = SentimentIntensityAnalyzer()
+    
+    if isinstance(texts, torch.Tensor):
+        texts = _ids_to_text_list(texts)
 
     nneg = nneu = npos = 0
     conf_neg = conf_neu = conf_pos = 0.0

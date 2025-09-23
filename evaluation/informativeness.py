@@ -10,7 +10,10 @@ TORCHEVAL_AVAILABLE = True
 
 # Import shared components from relevance evaluation
 from src.emotion_contagion.data_processor import EmotionContagionDataProcessor
-from portable_inference import build_agent, get_intent_distribution
+from portable_inference import build_random_intent
+from src.tokenizer_loader import get_tokenizer
+
+TOKENIZER = get_tokenizer()
 
 logger = logging.getLogger(__name__)
 
@@ -170,59 +173,80 @@ class InformativenessEvaluator:
         
         # Load intent predictions
         model_path = Path(__file__).parent.parent / 'pre-trained' / 'model' / 'model'
-        agent = build_agent(str(model_path))
+        # agent = build_agent(str(model_path))
         
         eval_samples = []
         
         # Process conversations following relevance_evaluation pattern
         for conv_idx, conv in enumerate(raw_data):
+            if not isinstance(conv, (list, tuple)) or len(conv) != 2:
+                continue
             user, response = conv
             min_len = min(len(user), len(response))
-            
+
             for i in range(min_len):
-                user_item = user[i]
-                response_item = response[i]
-                
-                user_tokens, user_labels = zip(*user_item)
-                response_tokens, response_labels = zip(*response_item)
-                
+                try:
+                    user_item = user[i]
+                    response_item = response[i]
+                    user_tokens, user_labels = zip(*user_item)
+                    response_tokens, _ = zip(*response_item)
+                except Exception:
+                    continue
+
                 user_tokens = list(user_tokens)
                 response_tokens = list(response_tokens)
-                
+
                 if not user_tokens or not response_tokens:
                     continue
-                
-                # Process user input for encoder
-                user_label_ids = [1 if label == '<em>' else 0 for label in user_labels]
-                
-                # Truncate if necessary
+
                 max_len = dp.max_length
+                user_label_ids = [1 if label == '<em>' else 0 for label in user_labels]
+
                 if len(user_tokens) > max_len:
                     user_tokens = user_tokens[:max_len]
                     user_label_ids = user_label_ids[:max_len]
-                
-                # Create attention mask and pad
-                seq_len = len(user_tokens)
-                user_attention_mask = [1] * seq_len + [0] * (max_len - seq_len)
-                user_tokens += ["[PAD]"] * (max_len - seq_len)
-                user_label_ids = user_label_ids + [0] * (max_len - len(user_label_ids))
-                
-                # Get intent prediction
-                p_intent = get_intent_distribution(agent, [{"origin_prompt": " ".join(user_tokens)}])[0]
-                
-                eval_sample = {
+
+                user_text = " ".join(user_tokens)
+                encoded = TOKENIZER(
+                    user_text,
+                    padding='max_length',
+                    truncation=True,
+                    max_length=max_len,
+                    return_tensors='pt'
+                )
+                user_input_ids = encoded['input_ids'][0].tolist()
+                user_attention_mask = encoded['attention_mask'][0].tolist()
+
+                if len(user_label_ids) < max_len:
+                    user_label_ids = user_label_ids + [0] * (max_len - len(user_label_ids))
+                else:
+                    user_label_ids = user_label_ids[:max_len]
+
+                response_text = " ".join(response_tokens)
+                resp_encoded = TOKENIZER(
+                    response_text,
+                    padding=False,
+                    truncation=True,
+                    max_length=max_len,
+                    add_special_tokens=False,
+                    return_tensors='pt'
+                )
+                response_input_ids = resp_encoded['input_ids'][0].tolist()
+
+                p_intent = build_random_intent([user_text], self.device)
+
+                eval_samples.append({
                     'user_tokens': user_tokens,
+                    'user_input_ids': user_input_ids,
                     'user_label_ids': user_label_ids,
                     'user_attention_mask': user_attention_mask,
                     'response_tokens': response_tokens,
+                    'response_input_ids': response_input_ids,
                     'p_intent': p_intent
-                }
-                
-                eval_samples.append(eval_sample)
-                
+                })
+
                 if max_samples and len(eval_samples) >= max_samples:
                     break
-            
             if max_samples and len(eval_samples) >= max_samples:
                 break
         
@@ -245,9 +269,9 @@ class InformativenessEvaluator:
             return None
         
         
-        # 1. Encode user input following relevance_evaluation pattern
+        # 1. Encode user input using tokenizer ids
         enc_out = self.encoder.forward(
-            tokens=[sample['user_tokens']],
+            tokens=torch.tensor([sample['user_input_ids']], dtype=torch.long, device=self.device),
             label_ids=torch.tensor([sample['user_label_ids']], dtype=torch.long, device=self.device),
             attention_mask=torch.tensor([sample['user_attention_mask']], dtype=torch.long, device=self.device),
             h_tilde=None
@@ -269,12 +293,20 @@ class InformativenessEvaluator:
             Emofused = Emofused.unsqueeze(1)
         
         # 3. Prepare response tokens for perplexity computation
-        response_tokens = response_text.strip().split()
-        token_ids = self.text_processor.tokens_to_ids(response_tokens)
-        
-        # Add BOS and prepare input/target sequences
-        input_ids = [self.text_processor.bos_id] + token_ids
-        target_ids = token_ids + [self.text_processor.eos_id]
+        # Tokenize response text with central tokenizer (no extra specials)
+        resp_enc = TOKENIZER(
+            response_text,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=64
+        )
+        token_ids = resp_enc['input_ids']
+
+        bos_id = TOKENIZER.cls_token_id if TOKENIZER.cls_token_id is not None else self.text_processor.bos_id
+        eos_id = TOKENIZER.sep_token_id if TOKENIZER.sep_token_id is not None else self.text_processor.eos_id
+
+        input_ids = [bos_id] + token_ids
+        target_ids = token_ids + [eos_id]
         
         if len(input_ids) != len(target_ids):
             return None

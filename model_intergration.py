@@ -14,71 +14,76 @@ from src.intent_twice.EMU import EMUConfig, EMU
 from src.intent_twice.IntentPolicy import IntentPolicy
 
 from src.intent_twice.response_decoder import create_paper_compliant_decoder
-from portable_inference import temp_load_intent, build_agent, get_intent_distribution
+from portable_inference import build_random_intent
 
-def build_emotion_contagion_encoder(vocab_size: int = 5000, model_dim: int = 128):
-    """构建情感传染编码器"""
+# Inline tokenizer loader (avoids import path issues during refactor)
+from src.tokenizer_loader import get_tokenizer
+TOKENIZER = get_tokenizer()
+
+def build_emotion_contagion_encoder(vocab_size: int = 5000, model_dim: int = 128, enc_cfg: Dict[str, Any] | None = None):
+    """构建情感传染编码器 (now parameterized by unified config)."""
+    vocab_size = len(TOKENIZER)
+    enc_cfg = enc_cfg or {}
     cfg = EmotionContagionConfig(
         vocab_size=vocab_size,
         word_embedding_dim=model_dim,
         model_dim=model_dim,
-        max_position_embeddings=256,
-        num_reason_labels=2,
-        num_encoder_layers=2,
-        num_attention_heads=4,
-        feedforward_dim=256,
-        attention_type="cross",  # or "gate"
-        attention_dropout=0.1,
-        dropout_rate=0.1,
+        max_position_embeddings=enc_cfg.get('max_position_embeddings', 256),
+        num_reason_labels=enc_cfg.get('num_reason_labels', 2),
+        num_encoder_layers=enc_cfg.get('layers', 2),
+        num_attention_heads=enc_cfg.get('heads', 4),
+        feedforward_dim=enc_cfg.get('ff_dim', 256),
+        attention_type=enc_cfg.get('attention_type', 'cross'),
+        attention_dropout=enc_cfg.get('attention_dropout', 0.1),
+        dropout_rate=enc_cfg.get('dropout', 0.1),
         era_hidden_dim=model_dim,
         era_projection_dim=model_dim,
     )
-    encoder = EmotionContagionEncoder(cfg)
-    return encoder
+    return EmotionContagionEncoder(cfg, external_tokenizer=TOKENIZER)
 
 
-def build_intent_twice_modules(model_dim: int = 128, emotion_dim: int = 32, intent_vocab_size: int = 9):
-    """构建Intent Twice模块"""
+def build_intent_twice_modules(model_dim: int = 128, config_section: Dict[str, Any] | None = None):
+    """构建Intent Twice模块 (parameterized)."""
+    cs = config_section or {}
+    emotion_dim = cs.get('emotion_dim', 32)
+    intent_vocab_size = cs.get('intent_vocab_size', 9)
+    diffusion_steps = cs.get('diffusion_steps', 10)
+    beta_start = cs.get('beta_start', 1e-4)
+    beta_end = cs.get('beta_end', 5e-2)
+    tau = cs.get('tau', 1.0)
     it_cfg = IntentTwiceConfig(
-        model_dim=model_dim, 
-        emotion_dim=emotion_dim, 
-        intent_vocab_size=intent_vocab_size, 
-        intent_embed_dim=model_dim
+        model_dim=model_dim,
+        emotion_dim=emotion_dim,
+        intent_vocab_size=intent_vocab_size,
+        intent_embed_dim=model_dim,
+        diffusion_steps=diffusion_steps,
+        beta_start=beta_start,
+        beta_end=beta_end,
+        tau=tau
     )
-    
-    # EMU expects emotion_dim (32) for the CVAE, not intent_vocab_size (9)
-    emu_cfg = EMUConfig(hidden_dim=model_dim, intent_vocab_size=intent_vocab_size, diffusion_steps=10)
+    emu_cfg = EMUConfig(
+        hidden_dim=model_dim,
+        intent_vocab_size=intent_vocab_size,
+        diffusion_steps=diffusion_steps,
+        beta_start=beta_start,
+        beta_end=beta_end,
+        use_cross_attn=cs.get('use_cross_attn', False),
+        n_heads=cs.get('n_heads', 4)
+    )
     emu = EMU(emu_cfg)
-    
-    # IntentPolicy expects refer_map: use top3 intents among first 9 intents
-    refer_map = {i: [0,1,2] for i in range(5)}
+    refer_map = {i: [0,1,2] for i in range(5)}  # keep simple; externalize later if needed
     policy = IntentPolicy(
-        state_dim=model_dim, 
-        intent_embed=nn.Embedding(it_cfg.intent_vocab_size, it_cfg.intent_embed_dim), 
+        state_dim=model_dim,
+        intent_embed=nn.Embedding(it_cfg.intent_vocab_size, it_cfg.intent_embed_dim),
         refer_map=refer_map
     )
-    
-    module = IntentTwiceModule(
-        config=it_cfg, 
-        encoder_module=None, 
-        emu_module=emu, 
+    return IntentTwiceModule(
+        config=it_cfg,
+        encoder_module=None,
+        emu_module=emu,
         intent_policy_module=policy
     )
-    return module
 
-
-def try_load_era_model(model_dim: int = 128):
-    try:
-        # 这里需要根据你的ERA实现来加载
-        # from src.era.era_model import ERA_BERT_CRF, ERAConfig
-        # era_cfg = ERAConfig(hidden_size=model_dim)
-        # era_model = ERA_BERT_CRF(era_cfg)
-        # return era_model
-        print("ERA model loading not implemented, using h_tilde=None")
-        return None
-    except Exception as e:
-        print(f"Failed to load ERA model: {e}")
-        return None
 
 
 def compute_joint_loss(Lem: torch.Tensor, Ltwice: torch.Tensor, Lres: torch.Tensor, 
@@ -93,14 +98,15 @@ def compute_joint_loss(Lem: torch.Tensor, Ltwice: torch.Tensor, Lres: torch.Tens
     return joint_loss
 
 class ReflectDiffu(nn.Module):
-    def __init__(self, vocab_size: int = 1000, model_dim: int = 128, device: torch.device = None, 
-                 use_era: bool = False, coverage_weight: float = 0.0):
+    def __init__(self, vocab_size: int = 1000, model_dim: int = 128, device: torch.device = None,
+                 use_era: bool = False, coverage_weight: float = 0.0, unified_config: Dict[str, Any] | None = None):
         super().__init__()
         self.vocab_size = vocab_size
         self.model_dim = model_dim
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.use_era = use_era
         self.coverage_weight = coverage_weight
+        self.unified_config = unified_config or {}
         
         # Placeholders for components
         self.encoder = None
@@ -123,15 +129,12 @@ class ReflectDiffu(nn.Module):
         self.dp = EmotionContagionDataProcessor(max_length=max_length)
         self.raw_data = self.dp.load_data(data_path)
         
-        # Process all data first to get vocab size
+        # Process all data first (tokenizer provides fixed vocab)
         model_path = os.path.join(os.path.dirname(__file__), 'pre-trained', 'model', 'model')
-        self.agent = build_agent(model_path)
-        
-        # Update vocab size based on all data
-        self.vocab_tokens = set()
-        def update_vocab(samples):
-            for sample in samples:
-                self.vocab_tokens.update(tok for tok in sample['tokens'] if tok != '[PAD]')
+        # self.agent = build_agent(model_path)
+
+        # Fixed tokenizer vocab size placeholder (not used but kept for compatibility)
+        self.vocab_tokens = None
         
         # Create batches
         self.batches = []
@@ -139,50 +142,42 @@ class ReflectDiffu(nn.Module):
         for i in range(0, total_samples):
             single_conv = self.raw_data[i]
             batch_user, batch_response = self.dp.process_batch(single_conv)
-            batch_p_intent = get_intent_distribution(self.agent, batch_user)
-            
-            update_vocab(batch_user)
-            update_vocab(batch_response)
+            batch_p_intent = build_random_intent(batch_user, self.device)
             
             self.batches.append({
                 'user': batch_user,
                 'response': batch_response,
                 'p_intent': batch_p_intent
             })
-        self.vocab_size = max(len(self.vocab_tokens) + 20, 100)  
-        print(f"Data loaded: {total_samples} total samples, {len(self.batches)} batches, vocab size: {self.vocab_size}")
+        self.vocab_size = len(TOKENIZER)
+        print(f"Data loaded: {total_samples} total samples, {len(self.batches)} batches, tokenizer vocab size: {self.vocab_size}")
         return self.batches
         
     def _init_encoder(self):
         """Initialize emotion contagion encoder."""
         print("\\n=== Initializing Encoder ===")
+        enc_cfg = self.unified_config.get('model', {}).get('encoder', {})
         self.encoder = build_emotion_contagion_encoder(
-            vocab_size=self.vocab_size, model_dim=self.model_dim
+            vocab_size=self.vocab_size,
+            model_dim=self.model_dim,
+            enc_cfg=enc_cfg
         ).to(self.device)
         
-        self.encoder.word_embedding.build_vocab([self.vocab_tokens])
+    # 使用预训练 tokenizer 的 vocab_size 已在构建阶段确定，不再动态 build
         
         # Initialize emotion classifier
         self.emotion_cls = EmotionClassifier(
             d_in=self.model_dim, num_emotions=32
         ).to(self.device)
         
-        # Try to load ERA model
-        if self.use_era:
-            self.era_model = try_load_era_model(self.model_dim)
-            if self.era_model:
-                self.era_model = self.era_model.to(self.device)
-                print("ERA model loaded successfully")
-            else:
-                print("ERA model loading failed, using h_tilde=None")
-        else:
-            print("Using h_tilde=None (ERA disabled)")
+        print("Using h_tilde=None (ERA disabled)")
             
     def _init_it_module(self):
         """Initialize Intent Twice module."""
         print("\\n=== Initializing Intent Twice Module ===")
+        it_cfg = self.unified_config.get('model', {}).get('intent_twice', {})
         self.it_module = build_intent_twice_modules(
-            model_dim=self.model_dim, emotion_dim=32
+            model_dim=self.model_dim, config_section=it_cfg
         ).to(self.device)
         self.it_module.encoder_module = self.encoder
         
@@ -192,12 +187,13 @@ class ReflectDiffu(nn.Module):
     def _init_decoder(self):
         """Initialize paper-compliant response decoder."""
         print("\\n=== Initializing Decoder ===")
+        dec_cfg = self.unified_config.get('model', {}).get('decoder', {})
         self.decoder_with_loss = create_paper_compliant_decoder(
             vocab_size=self.vocab_size,
             d_model=self.model_dim,
-            nhead=4,
-            dim_feedforward=256,
-            dropout=0.1,
+            nhead=dec_cfg.get('nhead', 4),
+            dim_feedforward=dec_cfg.get('ff_dim', 256),
+            dropout=dec_cfg.get('dropout', 0.1),
             with_loss=True,
             coverage_weight=self.coverage_weight
         ).to(self.device)
@@ -211,19 +207,17 @@ class ReflectDiffu(nn.Module):
         user_data = batch_data['user']
         response_data = batch_data['response']
         p_intent_data = batch_data['p_intent']
-        
-        # Prepare encoder inputs from user data
-        tokens = [s['tokens'] for s in user_data]
-        label_ids = torch.tensor([s['label_ids'] for s in user_data], 
-                                dtype=torch.long, device=self.device)
-        attention_mask = torch.tensor([s['attention_mask'] for s in user_data], 
-                                     dtype=torch.long, device=self.device)
+        # user_data entries already contain: 'input_ids' (list[int]), 'label_ids', 'attention_mask'
+
+        input_ids = torch.tensor([u['input_ids'] for u in user_data], dtype=torch.long, device=self.device)
+        attention_mask = torch.tensor([u['attention_mask'] for u in user_data], dtype=torch.long, device=self.device)
+        label_ids = torch.tensor([u['label_ids'] for u in user_data], dtype=torch.long, device=self.device)
         
         # Prepare decoder inputs from response data
         decoder_data = self._prepare_decoder_data(response_data, user_data)
         
         return {
-            'tokens': tokens,
+            'tokens': input_ids,  # now a LongTensor [B, L]
             'label_ids': label_ids,
             'attention_mask': attention_mask,
             'h_tilde': None,  # ERA placeholder
@@ -233,80 +227,45 @@ class ReflectDiffu(nn.Module):
         
     def _prepare_decoder_data(self, response_data, user_data):
         """Prepare decoder input data with real response tokens."""
-        # Add special tokens to vocabulary
-        special_tokens = ['<bos>', '<eos>', '[PAD]']
-        current_vocab = set(self.encoder.word_embedding.word_to_idx.keys())
-        new_tokens = [tok for tok in special_tokens if tok not in current_vocab]
-        
-        if new_tokens:
-            self._extend_vocabulary(new_tokens)
-        
-        bos_id = self.encoder.word_embedding.word_to_idx['<bos>']
-        eos_id = self.encoder.word_embedding.word_to_idx['<eos>']
-        pad_id = self.encoder.word_embedding.word_to_idx['[PAD]']
-        
-        # Extract response tokens from provided response data
-        responses_tokens = [sample['tokens'] for sample in response_data]
-        
-        # Convert to IDs and create teacher-forcing inputs
-        T = 16  # target sequence length
-        resp_ids_batch = []
-        
-        def tokens_to_ids(tokens):
-            return [self.encoder.word_embedding.word_to_idx.get(t, 
-                   self.encoder.word_embedding.word_to_idx.get('[UNK]', 0)) for t in tokens]
-        
-        for toks in responses_tokens:
-            ids = tokens_to_ids(toks)
-            ids = ids[:T-1] + [eos_id] if len(ids) >= T else ids + [eos_id]
-            if len(ids) < T:
-                ids = ids + [pad_id] * (T - len(ids))
+        max_resp_len = self.unified_config.get('model', {}).get('decoder', {}).get('max_resp_len', 16)
+
+        # Response items already preprocessed? If processor updated similarly, expect 'input_ids'.
+        resp_ids_list = [r['input_ids'] for r in response_data]
+        resp_texts = [' '.join(r.get('tokens', [])) for r in response_data]
+
+        # Ensure each response id sequence is length max_resp_len
+        trimmed_resp_ids = []
+        for ids in resp_ids_list:
+            if len(ids) > max_resp_len:
+                trimmed_resp_ids.append(ids[:max_resp_len])
+            elif len(ids) < max_resp_len:
+                pad_id_local = TOKENIZER.pad_token_id if TOKENIZER.pad_token_id is not None else 0
+                trimmed_resp_ids.append(ids + [pad_id_local] * (max_resp_len - len(ids)))
             else:
-                ids = ids[:T]
-            resp_ids_batch.append(ids)
-        
-        resp_ids = torch.tensor(resp_ids_batch, device=self.device, dtype=torch.long)
-        
-        # Teacher-forcing setup
+                trimmed_resp_ids.append(ids)
+        resp_ids = torch.tensor(trimmed_resp_ids, dtype=torch.long, device=self.device)
+
+        # Special tokens
+        pad_id = TOKENIZER.pad_token_id if TOKENIZER.pad_token_id is not None else 0
+        bos_id = TOKENIZER.cls_token_id if TOKENIZER.cls_token_id is not None else (TOKENIZER.bos_token_id or pad_id)
+        eos_id = TOKENIZER.sep_token_id if TOKENIZER.sep_token_id is not None else (TOKENIZER.eos_token_id or pad_id)
+
+        # Teacher forcing input (prepend BOS, shift right)
         bos_col = torch.full((resp_ids.size(0), 1), bos_id, device=self.device, dtype=torch.long)
         trg_input_ids = torch.cat([bos_col, resp_ids[:, :-1]], dim=1)
         gold_ids = resp_ids
         tgt_key_padding_mask = (trg_input_ids == pad_id)
-        
-        # Source token IDs for pointer-generator from user data
-        src_ids_from_encoder = torch.tensor(
-            [[self.encoder.word_embedding.word_to_idx.get(tok, 0) for tok in s['tokens']] 
-             for s in user_data],
-            device=self.device, dtype=torch.long
-        )
-        
+
+        # Source ids: reuse already prepared encoder ids from user_data (do NOT re-tokenize)
+        src_ids_from_encoder = torch.tensor([u['input_ids'] for u in user_data], dtype=torch.long, device=self.device)
+
         return {
             'trg_input_ids': trg_input_ids,
             'gold_ids': gold_ids,
             'tgt_key_padding_mask': tgt_key_padding_mask,
             'src_ids_from_encoder': src_ids_from_encoder,
-            'responses_tokens': responses_tokens
+            'responses_tokens': resp_texts
         }
-        
-    def _extend_vocabulary(self, new_tokens):
-        """Extend vocabulary with new tokens."""
-        current_vocab = set(self.encoder.word_embedding.word_to_idx.keys())
-        all_tokens = list(current_vocab) + new_tokens
-        
-        # Rebuild mappings
-        self.encoder.word_embedding.word_to_idx = {word: idx for idx, word in enumerate(sorted(all_tokens))}
-        self.encoder.word_embedding.idx_to_word = {idx: word for word, idx in self.encoder.word_embedding.word_to_idx.items()}
-        
-        # Extend embedding layer
-        old_vocab_size = self.encoder.word_embedding.vocab_size
-        new_vocab_size = len(self.encoder.word_embedding.word_to_idx)
-        if new_vocab_size > old_vocab_size:
-            old_weight = self.encoder.word_embedding.embedding.weight.data
-            self.encoder.word_embedding.embedding = nn.Embedding(
-                new_vocab_size, self.encoder.word_embedding.embedding_dim
-            ).to(self.device)
-            self.encoder.word_embedding.embedding.weight.data[:old_vocab_size] = old_weight
-            self.encoder.word_embedding.vocab_size = new_vocab_size
         
     def forward(self, batch_data=None):
         """
@@ -364,7 +323,7 @@ class ReflectDiffu(nn.Module):
         L_emof = Emofused.size(1)
         if src_ids_from_encoder.size(1) < L_emof:
             pad_cols = L_emof - src_ids_from_encoder.size(1)
-            pad_id = self.encoder.word_embedding.word_to_idx['[PAD]']
+            pad_id = TOKENIZER.pad_token_id if TOKENIZER.pad_token_id is not None else 0
             src_token_ids = F.pad(src_ids_from_encoder, (0, pad_cols), value=pad_id)
         else:
             src_token_ids = src_ids_from_encoder[:, :L_emof]
