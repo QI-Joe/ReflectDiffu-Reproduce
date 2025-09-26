@@ -9,16 +9,19 @@ Based on specifications in EAR.md.
 """
 
 import os
-import json
 import pandas as pd
 import numpy as np
 from typing import List, Dict, Tuple, Optional, Union
+from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 from pathlib import Path
 import logging
 from dataclasses import dataclass
 import pickle
 import random
 from sklearn.model_selection import train_test_split
+from openai import OpenAI
+import re
+import string
 
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -26,6 +29,7 @@ from transformers import AutoTokenizer, AutoModel
 
 logger = logging.getLogger(__name__)
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+EDGE_PUNCT = string.punctuation
 
 @dataclass
 class DialogueSample:
@@ -33,14 +37,17 @@ class DialogueSample:
     Represents a single dialogue sample with emotion reason annotations.
     """
     conv_id: str
-    utterance_id: int
-    utterance: str
-    speaker_id: int
+    round_talk: int
+    speaker_id: List[int]
     emotion: str
     prompt: str
-    tokens: List[str]
-    labels: List[str]  # <em> or <noem>
-    selfeval: list[list[int]]
+    user_tokens: List[str]
+    user_labels: List[str]
+    response_tokens: List[str]
+    response_labels: List[str]
+    selfeval: str
+    user_src_text: str
+    consistency: bool
     
 
 @dataclass
@@ -69,6 +76,7 @@ class EmpathyDataProcessor:
     def __init__(
         self,
         data_dir: str,
+        if_api: bool = False,
         llm_model_path: str = None,
         tokenizer_model: str = "bert-base",
         max_length: int = 512,
@@ -92,7 +100,7 @@ class EmpathyDataProcessor:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         
         # Initialize tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_model)
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_model) if not if_api else None
         
         # Label mappings
         self.label_to_id = {"O": 0, "EM": 1}
@@ -102,8 +110,40 @@ class EmpathyDataProcessor:
         # Initialize LLM for annotation (if provided)
         self.llm_model = None
         self.llm_tokenizer = None
-        if llm_model_path and os.path.exists(llm_model_path):
+        if not if_api and llm_model_path and os.path.exists(llm_model_path):
             self._load_llm_model()
+    
+    def _load_API_data(self):
+        """Load API LLM model for data annotation."""
+        GROK3_API = ''
+        GROK_URL = "https://api.x.ai/v1"
+        return GROK3_API, GROK_URL
+
+    def _call_API_LLM_model(self, given_prompt: str):
+        api, model_url = self._load_API_data()
+        client = OpenAI(
+            api_key=api,
+            base_url=model_url
+        )
+
+        response = client.chat.completions.create(
+            model="grok-3",
+            messages=[
+                {"role": "system", "content": """You are a helpful assistant. Please analyze the following dialogue and identify words that represent emotion reasons.
+        Mark each word with <em> if it's an emotion reason word, or <noem> if it's not.
+        Attention! you should only label for words in "Speaker" and ignore "Emotion" and "Context" 
+        Please provide the output in the following format:
+        word1:<em/noem> word2:<em/noem> ...
+        Example:
+        Input: "I am very sad because I lost my dog"
+        Output: I:<noem> am:<noem> very:<noem> sad:<em> because:<noem> I:<noem> lost:<em> my:<noem> dog:<noem>"""},
+                {"role": "user", "content": str(given_prompt)}
+            ],
+            max_tokens=1000,
+            temperature=0.0
+        )
+    
+        return response.choices[0].message.content
     
     def _load_llm_model(self):
         """Load LLM model for data annotation."""
@@ -124,145 +164,167 @@ class EmpathyDataProcessor:
             logger.warning(f"Failed to load LLM model: {e}")
             self.llm_model = None
             self.llm_tokenizer = None
+            
+    def model_eject(self, llm_model, llm_tokenizer):
+        self.llm_model = llm_model
+        self.llm_tokenizer = llm_tokenizer
     
-    def load_empathetic_dialogues(self) -> List[DialogueSample]:
+    def pattern_parser(self, df: pd.DataFrame, if_api: bool, task, threshold):
+        dialogues, counter, prev = [], 1100, 1100
+        
+        for conv_id, group in df.groupby('conv_id'):
+            group_length = len(group)
+            load_length = (group_length // 2) * 2
+            
+            if group_length<2: continue
+            
+            user_id, response_id, group_dialogues = int(group.iloc[0]['speaker_idx']), int(group.iloc[1]['speaker_idx']), list()
+            counter += 1
+            for idx in range(0, load_length, 2):
+                user_row, response_row = group.iloc[idx], group.iloc[idx+1]
+                # Extract dialogue information
+                conv_id = str(user_row.get('conv_id', ''))
+                round_talk = int(group_length//2)
+                emotion = str(user_row.get('context', ''))  # emotion context
+                prompt = str(user_row.get('prompt', ''))
+                selfeval = str(user_row.get('selfeval', ''))
+                # selfeval = [list(map(int, eval.split("|"))) for eval in selfeval.split("_")]
+                
+                user_utterance = str(user_row.get('utterance', ''))
+                user_speaker_idx = int(user_row.get('speaker_idx', -1))
+                assert user_speaker_idx == user_id, "User speaker_idx mismatch"
+                if not if_api:
+                    user_token, user_label, consistency_check = self.fast_annotate_llm(user_utterance, user_speaker_idx == response_id)
+                else:
+                    user_token, user_label = self.fast_annotate_api_llm(user_utterance, user_speaker_idx == response_id)
+        
+                    
+                response_utterance = str(response_row.get('utterance', ''))
+                response_speaker_idx = int(response_row.get('speaker_idx', -1))
+                assert response_speaker_idx == response_id, "Response speaker_idx mismatch"
+                response_token, response_label, _ = self.fast_annotate_llm(response_utterance, response_speaker_idx == response_id)
+                # Create sample without labels initially
+                sample = DialogueSample(
+                    conv_id=conv_id,
+                    speaker_id=[user_id, response_id],
+                    round_talk=round_talk,
+                    emotion=emotion,
+                    user_tokens=user_token,
+                    user_labels=user_label,
+                    response_tokens=response_token,
+                    response_labels=response_label,
+                    prompt=prompt,
+                    selfeval=selfeval,
+                    user_src_text=user_utterance,
+                    consistency=consistency_check > threshold
+                )
+                group_dialogues.append(sample)
+            dialogues.extend(group_dialogues)
+            
+            if (counter+1)%100 == 0:
+                with open(rf"../../dataset/local_llm/annotated_{task}_{prev}_{counter}.pkl", "wb") as f:
+                    pickle.dump(dialogues, f)
+                print(f"saved {(counter+1)//100}th round data with name annotated_{prev}_{counter}.pkl")
+                prev, dialogues = counter+1, []
+
+        return dialogues
+    
+    # More robust data cleaning function
+    def clean_empathetic_dialogues_data(self, df):
+        print("Cleaning empathetic dialogues data...")
+        
+        # Check for various corruption patterns
+        initial_count = len(df)
+        
+        # 1. Remove rows with extremely long conv_id (likely corrupted)
+        conv_id_lengths = df['conv_id'].str.len()
+        max_normal_length = 50  # Normal conv_ids are like "hit:123_conv:456"
+        corrupted_conv_id = df[conv_id_lengths > max_normal_length]
+        
+        conv_id_pattern = r'^hit:\d+_conv:\d+$'
+        valid_conv_id_mask = df['conv_id'].str.match(conv_id_pattern, na=False)
+        
+        # 3. Remove rows where essential fields are NaN
+        essential_fields = ['conv_id', 'utterance']
+        valid_essential_mask = df[essential_fields].notna().all(axis=1)
+        
+        # Combine all cleaning criteria
+        clean_mask = (conv_id_lengths <= max_normal_length) & valid_conv_id_mask & valid_essential_mask
+        
+        cleaned_df = df[clean_mask].copy()
+        
+        print(f"Original rows: {initial_count}")
+        print(f"Rows with long conv_id: {len(corrupted_conv_id)}")
+        print(f"Rows with invalid conv_id format: {(~valid_conv_id_mask).sum()}")
+        print(f"Rows with missing essential fields: {(~valid_essential_mask).sum()}")
+        print(f"Final cleaned rows: {len(cleaned_df)}")
+        print(f"Removed {initial_count - len(cleaned_df)} corrupted rows total")
+        
+        return cleaned_df
+
+    
+    def load_empathetic_dialogues(self, given_df: pd.DataFrame, filename: str, if_api: bool=False) -> List[DialogueSample]:
         """
         Load EmpatheticDialogues dataset from CSV files.
         
         Returns:
             List of DialogueSample objects
         """
-        # Check cache first
-        cache_file = self.cache_dir / "raw_dialogues.pkl"
-        if cache_file.exists():
-            logger.info("Loading dialogues from cache...")
-            with open(cache_file, 'rb') as f:
-                return pickle.load(f)
-        
-        logger.info("Loading EmpatheticDialogues dataset...")
         
         dialogues = []
         
-        # Load train, valid, test splits
-        for split in ['sample_train']: # , 'valid', 'test'
-            csv_file = self.data_dir / f"{split}.csv"
-            if not csv_file.exists():
-                logger.warning(f"File not found: {csv_file}")
-                continue
-            
-            logger.info(f"Loading {split} data...")
-            df = pd.read_csv(csv_file, encoding='latin-1', 
-                            engine='python', on_bad_lines='skip')
-            
-            for idx, row in df.iterrows():
-                # Extract dialogue information
-                conv_id = str(row.get('conv_id', ''))
-                utterance = str(row.get('utterance', ''))
-                utterance_idx = int(row.get('utterance_idx', -1))
-                speaker_idx = int(row.get('speaker_idx', -1))
-                emotion = str(row.get('context', ''))  # emotion context
-                prompt = str(row.get('prompt', ''))
-                selfeval = str(row.get('selfeval', ''))
-                selfeval = [list(map(int, eval.split("|"))) for eval in selfeval.split("_")]
-                
-                if utterance and len(utterance.strip()) > 0:
-                    # Create sample without labels initially
-                    sample = DialogueSample(
-                        conv_id=conv_id,
-                        speaker_id=speaker_idx,
-                        utterance=utterance,
-                        utterance_id=utterance_idx,
-                        emotion=emotion,
-                        tokens=[],  # Will be filled by tokenization
-                        labels=[],  # Will be filled by annotation
-                        prompt=prompt,
-                        selfeval=selfeval
-                    )
-                    dialogues.append(sample)
+        logger.info(f"Loading {filename} data...")
+        df = given_df
+        if filename=="test":
+            df = self.clean_empathetic_dialogues_data(df)
+        dialogues = self.pattern_parser(df, if_api, filename, 0.6)
         
         logger.info(f"Loaded {len(dialogues)} dialogue samples")
         
-        # Cache raw dialogues
-        with open(cache_file, 'wb') as f:
-            pickle.dump(dialogues, f)
-        
         return dialogues
     
-    def annotate_with_llm(self, dialogues: List[DialogueSample]) -> List[DialogueSample]:
-        """
-        Annotate dialogues with emotion reason labels using LLM.
+    def jaccard_sim(self, s1, s2):
+        clean = lambda s: set([
+            w for w in re.sub(r"[^\w\s]", "", s.lower()).split()
+            if w not in ENGLISH_STOP_WORDS
+        ])
+        set1, set2 = clean(s1), clean(s2)
+        return len(set1 & set2) / max(1, len(set1 | set2))
         
-        Args:
-            dialogues: List of DialogueSample objects
-            
-        Returns:
-            List of annotated DialogueSample objects
-        """
-        # Check cache first
-        cache_file = self.cache_dir / f"annotated_dialogues_{self.num_labels}.pkl"
-        if cache_file.exists():
-            logger.info("Loading annotated dialogues from cache...")
-            with open(cache_file, 'rb') as f:
-                return pickle.load(f)
-        
-        logger.info("Annotating dialogues with LLM...")
-        
-        annotated_dialogues = []
-        
-        for i, dialogue in enumerate(dialogues):
-            if i % 100 == 0:
-                logger.info(f"Annotating dialogue {i+1}/{len(dialogues)}")
-            if dialogue.speaker_id:
-                dialogue.tokens=dialogue.utterance.split()
-                dialogue.labels = ["<noem>" for _ in len(tokens)]
-                annotated_dialogues.append(dialogue)
-                continue
-            try:
-                # Get LLM annotation
-                tokens, labels = self._get_llm_annotation(dialogue)
-                
-                # Update dialogue sample
-                dialogue.tokens = tokens
-                dialogue.labels = labels
-                annotated_dialogues.append(dialogue)
-                
-            except Exception as e:
-                logger.warning(f"Failed to annotate dialogue {dialogue.dialogue_id}: {e}")
-                continue
-        
-        # Cache annotated dialogues
-        with open(cache_file, 'wb') as f:
-            pickle.dump(annotated_dialogues, f)
-        
-        logger.info(f"Annotated {len(annotated_dialogues)} dialogues")
-        return annotated_dialogues
-    
-    def _get_llm_annotation(self, dialogue: DialogueSample, given_query_function: callable=None) -> Tuple[List[str], List[str]]:
-        """
-        Get emotion reason annotation from LLM.
-        
-        Args:
-            dialogue: DialogueSample to annotate
-            
-        Returns:
-            Tuple of (tokens, labels)
-        """
-        # Create prompt for LLM
+    def fast_annotate_llm(self, dialogue: str, is_response: bool):
+        if is_response:
+            tokens = [tok for tok in dialogue.split()]
+            labels = ["<noem>" for _ in tokens]
+            return tokens, labels, -1
+        preprocessed = [self.normalize_text(tok) for tok in dialogue.split()]
+        length = len(preprocessed)
+        dialogue = ' '.join(preprocessed)
         prompt = self._create_annotation_prompt(dialogue)
+        response = self._query_llm(prompt)
+        tokens, labels = self._parse_llm_response(response, dialogue)
         
-        # Get LLM response
-        if not given_query_function:
-            response = given_query_function(prompt)
-        else:
-            with torch.no_grad():
-                response = self._query_llm(prompt)
-
-        # Parse response to extract tokens and labels
-        tokens, labels = self._parse_llm_response(response, dialogue.utterance)
-        
-        return tokens, labels
+        simlarity = self.jaccard_sim(' '.join(tokens[1:1+length]), dialogue)
+        return tokens[1:], labels[1:], simlarity
     
-    def _create_annotation_prompt(self, dialogue: DialogueSample) -> str:
+    def fast_annotate_api_llm(self, dialogue: str, is_response: bool):
+        if is_response:
+            tokens = dialogue.split()
+            labels = ["<noem>" for _ in tokens]
+            return tokens, labels
+        response = self._call_API_LLM_model(dialogue)
+        tokens, labels = self._parse_llm_response(response, dialogue)
+        return tokens, labels
+
+    def normalize_text(self, s: str) -> str:
+        # Light normalization; adjust as needed
+        s = s.lower()
+        # Replace placeholder tokens
+        s = s.replace("_comma_", "")
+        # Remove repeated spaces and strip
+        s = re.sub(r"\s+", " ", s).strip(EDGE_PUNCT)
+        return s
+    
+    def _create_annotation_prompt(self, dialogue: str) -> str:
         """
         Create prompt for LLM annotation.
         
@@ -273,19 +335,29 @@ class EmpathyDataProcessor:
             Formatted prompt string
         """
         prompt = f"""
-Dialogue Context:
-Emotion: {dialogue.emotion}
-Context: {dialogue.prompt}
-Speaker: {dialogue.utterance}
+You are an expert linguistic annotator.
 
-Please provide the output in the following format:
-word1:<em/noem> word2:<em/noem> ...
+Your task:
+- For each word spoken by Speaker, decide if it expresses an emotional state or emotional reason.
+- If yes → label with <em>
+- If not → label with <noem>
+- Ignore punctuation completely.
+- Important: Give only the labels in the format word:<em/noem> separated by spaces.
+- Do not explain your reasoning in the output.
+
+Process:
+1. Read the dialogue carefully.
+2. Think step by step (internally, without writing it out) about each word's meaning.
+3. Then output the final result strictly in the required format.
+
+Dialogue:
+Speaker: <Start> {dialogue} <End>
 
 Example:
-Input: "I am very sad because I lost my dog"
-Output: I:<noem> am:<noem> very:<noem> sad:<em> because:<noem> I:<noem> lost:<em> my:<noem> dog:<noem>
+"I am very sad because I lost my dog"
+I:<noem> am:<noem> very:<noem> sad:<em> because:<noem> I:<noem> lost:<em> my:<noem> dog:<noem>
 
-Your output:
+Now your output:
 """
         return prompt
     
@@ -333,25 +405,13 @@ Your output:
         tokens = []
         labels = []
         
-        try:
-            # Parse format: word1:<em/noem> word2:<em/noem> ...
-            parts = response.split()
-            for part in parts:
-                if ':' in part:
-                    word, label = part.split(':', 1)
-                    tokens.append(word)
-                    
-                    # Convert to standard label format
-                    if '<em>' in label or 'em>' in label:
-                        labels.append('<em>')
-                    else:
-                        labels.append('<noem>')
-        except Exception as e:
-            logger.warning(f"Failed to parse LLM response: {e}")
-            # Fall back to simple tokenization
-            tokens = original_text.split()
-            labels = ['<noem>'] * len(tokens)
-        
+        parts = response.split()
+        for part in parts:
+            if ':' in part:
+                word, label = part.split(':', 1)
+                tokens.append(word)
+                labels.append(label)    
+            
         # Ensure tokens and labels have same length
         if len(tokens) != len(labels):
             logger.warning("Token-label length mismatch, using simple tokenization")
@@ -360,6 +420,7 @@ Your output:
         
         return tokens, labels
     
+
     def tokenize_and_align_labels(self, dialogues: List[DialogueSample]) -> List[TokenizedSample]:
         """
         Tokenize samples and align labels with subword tokens.

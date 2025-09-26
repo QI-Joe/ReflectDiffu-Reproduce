@@ -25,11 +25,17 @@ import logging
 import os
 import pickle
 from src.tokenizer_loader import get_tokenizer
+from src.era.data_processor import DialogueSample
 
 logger = logging.getLogger(__name__)
 
 TOKENIZER = get_tokenizer()
 
+class RenameUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        if module == "data_processor":
+            module = "src.era.data_processor"
+        return super().find_class(module, name)
 
 class EmotionContagionDataProcessor:
     """
@@ -65,7 +71,7 @@ class EmotionContagionDataProcessor:
         # Single file handling
         if data_path.endswith('.pkl'):
             with open(data_path, 'rb') as f:
-                loaded = pickle.load(f)
+                loaded = RenameUnpickler(f).load()
             if isinstance(loaded, list):
                 data = loaded
             else:
@@ -77,7 +83,7 @@ class EmotionContagionDataProcessor:
             f"Unsupported data file type for '{data_path}'. Expected directory or .pkl file."
         )
     
-    def process_sample(self, sample: Dict, user: bool) -> Dict:
+    def process_sample(self, sample: DialogueSample) -> Dict:
         """
         Process a single sample to extract tokens, labels, and create masks.
         
@@ -88,49 +94,52 @@ class EmotionContagionDataProcessor:
             Processed sample with aligned tokens/labels and attention mask
         """
         # Expect sample as list of (token,label) tuples
-        word_tokens, word_labels = zip(*sample)
-        word_tokens = list(word_tokens)
-        word_labels = list(word_labels)
+        user_tokens, user_labels = sample.user_tokens, sample.user_labels
+        response_tokens, response_labels = sample.response_tokens, sample.response_labels
 
-        if len(word_tokens) != len(word_labels):
-            raise ValueError(f"Token-label mismatch: {len(word_tokens)} vs {len(word_labels)}")
+        def inner_label(word_tokens, word_labels, is_user: bool):
 
-        # Truncate at word level first (labels follow)
-        if len(word_tokens) > self.max_length:
-            word_tokens = word_tokens[:self.max_length]
-            word_labels = word_labels[:self.max_length]
+            if len(word_tokens) != len(word_labels):
+                raise ValueError(f"Token-label mismatch: {len(word_tokens)} vs {len(word_labels)}")
 
-        # Word-level emotion label ids (no expansion to wordpieces)
-        label_ids = [self.label_to_id.get(l, 0) for l in word_labels]
+            # Truncate at word level first (labels follow)
+            if len(word_tokens) > self.max_length:
+                word_tokens = word_tokens[:self.max_length]
+                word_labels = word_labels[:self.max_length]
 
-        # Tokenizer over the joined text; relies on HF internal wordpiece + max_length padding
-        text = " ".join(word_tokens)
-        encoded = TOKENIZER(
-            text,
-            padding='max_length',
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors='pt'
-        )
-        input_ids = encoded['input_ids'][0].tolist()
-        attention_mask = encoded['attention_mask'][0].tolist()
+            # Word-level emotion label ids (no expansion to wordpieces)
+            label_ids = [self.label_to_id.get(l, 0) for l in word_labels]
 
-        # Pad label_ids to max_length (labels correspond to first N original words)
-        if len(label_ids) < self.max_length:
-            label_ids = label_ids + [0] * (self.max_length - len(label_ids))
+            # Tokenizer over the joined text; relies on HF internal wordpiece + max_length padding
+            text = " ".join(word_tokens)
+            encoded = TOKENIZER(
+                text,
+                padding='max_length',
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors='pt'
+            )
+            input_ids = encoded['input_ids'][0].tolist()
+            attention_mask = encoded['attention_mask'][0].tolist()
 
-        seq_len = min(len(word_tokens), self.max_length)
+            # Pad label_ids to max_length (labels correspond to first N original words)
+            if len(label_ids) < self.max_length:
+                label_ids = label_ids + [0] * (self.max_length - len(label_ids))
 
-        return {
-            'tokens': word_tokens[:seq_len],  # unpadded original words
-            'input_ids': input_ids,            # token ids length = max_length
-            'label_ids': label_ids,            # word-level labels padded to max_length
-            'labels': word_labels[:seq_len],   # truncated labels (no padding strings)
-            'attention_mask': attention_mask,  # tokenizer mask length = max_length
-            'seq_len': seq_len,
-            'user': user,
-            'origin_prompt': text
-        }
+            seq_len = min(len(word_tokens), self.max_length)
+
+            return {
+                'tokens': word_tokens[:seq_len],  # unpadded original words
+                'input_ids': input_ids,            # token ids length = max_length
+                'label_ids': label_ids,            # word-level labels padded to max_length
+                'labels': word_labels[:seq_len],   # truncated labels (no padding strings)
+                'attention_mask': attention_mask,  # tokenizer mask length = max_length
+                'seq_len': seq_len,
+                'user': is_user,
+                'origin_prompt': text,
+                'matched_emotion': sample.emotion
+            }
+        return inner_label(user_tokens, user_labels, True), inner_label(response_tokens, response_labels, False)
     
     def process_batch(self, samples: List[Dict], ifeval: bool=False) -> List[Dict]:
         """            
@@ -139,11 +148,10 @@ class EmotionContagionDataProcessor:
         """
         user_batch, response_batch = list(), list()
         
-        user, response = samples
-        user_process, response_process = [self.process_sample(single_user, True) for single_user in user], \
-            [self.process_sample(single_response, False) for single_response in response]
-        user_batch.extend(user_process)
-        response_batch.extend(response_process)
+        for idx, sample in enumerate(samples):
+            user_process, response_process = self.process_sample(sample)
+            user_batch.append(user_process)
+            response_batch.append(response_process)
 
         return user_batch, response_batch
     

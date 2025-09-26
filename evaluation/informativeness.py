@@ -10,8 +10,10 @@ TORCHEVAL_AVAILABLE = True
 
 # Import shared components from relevance evaluation
 from src.emotion_contagion.data_processor import EmotionContagionDataProcessor
-from portable_inference import build_random_intent
+from portable_inference import build_random_intent, build_agent, get_intent_distribution
 from src.tokenizer_loader import get_tokenizer
+from evaluation.utils import prepare_evaluation_data
+from src.emotion_contagion.foundation_emb import IntentSemanticScorer
 
 TOKENIZER = get_tokenizer()
 
@@ -152,106 +154,9 @@ class InformativenessEvaluator:
             logger.warning("torcheval not available, perplexity will be computed manually")
         
         # Initialize semantic scorer for inference
-        from src.emotion_contagion.foundation_emb import IntentSemanticScorer
         self.semantic_scorer = IntentSemanticScorer(d_in=128).to(device)
         
         logger.info(f"InformativenessEvaluator initialized on device: {device}")
-    
-    def prepare_evaluation_data(self, data_path: str = "dataset/emotion_labels_test.pkl", max_samples: int = None):
-        """
-        Prepare evaluation data from test file following relevance_evaluation pattern.
-        
-        Args:
-            data_path: Path to test data file
-            max_samples: Maximum number of samples to process
-            
-        Returns:
-            List of processed evaluation samples
-        """
-        dp = EmotionContagionDataProcessor(max_length=64)
-        raw_data = dp.load_data(data_path)
-        
-        # Load intent predictions
-        model_path = Path(__file__).parent.parent / 'pre-trained' / 'model' / 'model'
-        # agent = build_agent(str(model_path))
-        
-        eval_samples = []
-        
-        # Process conversations following relevance_evaluation pattern
-        for conv_idx, conv in enumerate(raw_data):
-            if not isinstance(conv, (list, tuple)) or len(conv) != 2:
-                continue
-            user, response = conv
-            min_len = min(len(user), len(response))
-
-            for i in range(min_len):
-                try:
-                    user_item = user[i]
-                    response_item = response[i]
-                    user_tokens, user_labels = zip(*user_item)
-                    response_tokens, _ = zip(*response_item)
-                except Exception:
-                    continue
-
-                user_tokens = list(user_tokens)
-                response_tokens = list(response_tokens)
-
-                if not user_tokens or not response_tokens:
-                    continue
-
-                max_len = dp.max_length
-                user_label_ids = [1 if label == '<em>' else 0 for label in user_labels]
-
-                if len(user_tokens) > max_len:
-                    user_tokens = user_tokens[:max_len]
-                    user_label_ids = user_label_ids[:max_len]
-
-                user_text = " ".join(user_tokens)
-                encoded = TOKENIZER(
-                    user_text,
-                    padding='max_length',
-                    truncation=True,
-                    max_length=max_len,
-                    return_tensors='pt'
-                )
-                user_input_ids = encoded['input_ids'][0].tolist()
-                user_attention_mask = encoded['attention_mask'][0].tolist()
-
-                if len(user_label_ids) < max_len:
-                    user_label_ids = user_label_ids + [0] * (max_len - len(user_label_ids))
-                else:
-                    user_label_ids = user_label_ids[:max_len]
-
-                response_text = " ".join(response_tokens)
-                resp_encoded = TOKENIZER(
-                    response_text,
-                    padding=False,
-                    truncation=True,
-                    max_length=max_len,
-                    add_special_tokens=False,
-                    return_tensors='pt'
-                )
-                response_input_ids = resp_encoded['input_ids'][0].tolist()
-
-                p_intent = build_random_intent([user_text], self.device)
-
-                eval_samples.append({
-                    'user_tokens': user_tokens,
-                    'user_input_ids': user_input_ids,
-                    'user_label_ids': user_label_ids,
-                    'user_attention_mask': user_attention_mask,
-                    'response_tokens': response_tokens,
-                    'response_input_ids': response_input_ids,
-                    'p_intent': p_intent
-                })
-
-                if max_samples and len(eval_samples) >= max_samples:
-                    break
-            if max_samples and len(eval_samples) >= max_samples:
-                break
-        
-        logger.info(f"Prepared {len(eval_samples)} evaluation samples")
-        return eval_samples
     
     @torch.no_grad()
     def compute_perplexity_for_response(self, sample: dict, response_text: str) -> Optional[float]:
@@ -271,9 +176,9 @@ class InformativenessEvaluator:
         
         # 1. Encode user input using tokenizer ids
         enc_out = self.encoder.forward(
-            tokens=torch.tensor([sample['user_input_ids']], dtype=torch.long, device=self.device),
-            label_ids=torch.tensor([sample['user_label_ids']], dtype=torch.long, device=self.device),
-            attention_mask=torch.tensor([sample['user_attention_mask']], dtype=torch.long, device=self.device),
+            tokens=torch.tensor([sample.user_input_ids], dtype=torch.long, device=self.device),
+            label_ids=torch.tensor([sample.user_label_ids], dtype=torch.long, device=self.device),
+            attention_mask=torch.tensor([sample.user_attention_mask], dtype=torch.long, device=self.device),
             h_tilde=None
         )
         
@@ -285,7 +190,7 @@ class InformativenessEvaluator:
         
         it_out = self.it_module.forward(
             encoder_out=enc_out,
-            intent_out={"p_intent": sample['p_intent']}
+            intent_out={"p_intent": sample.p_intent}
         )
         
         Emofused = it_out["Emofused"]
@@ -408,10 +313,10 @@ class InformativenessEvaluator:
         Returns:
             InformativenessResults object
         """
-        eval_samples = self.prepare_evaluation_data(data_path=data_path, max_samples=max_samples)
+        eval_samples = prepare_evaluation_data()
         
         # Extract response texts for evaluation
-        responses = [' '.join(sample['response_tokens']) for sample in eval_samples]
+        responses = [' '.join(sample.response_tokens) for sample in eval_samples]
         
         return self.evaluate_responses(responses, eval_samples)
 
@@ -432,58 +337,4 @@ def print_informativeness_results(results: InformativenessResults, title: str = 
     print(f"{'='*50}")
 
 
-def load_model_and_evaluate(model_path: str, data_path: str = "dataset/emotion_labels_test.pkl", 
-                          max_samples: int = None, device: torch.device = None) -> InformativenessResults:
-    """
-    Convenience function to load model and evaluate informativeness.
-    
-    Args:
-        model_path: Path to saved model (.pt file)
-        data_path: Path to test data file
-        max_samples: Maximum number of samples to evaluate
-        device: Torch device
-        
-    Returns:
-        InformativenessResults object
-    """
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # Load model
-    model = torch.load(model_path, map_location=device)
-    model.eval()
-    
-    # Create evaluator
-    decoder = getattr(model, 'decoder_with_loss', model.decoder)
-    evaluator = InformativenessEvaluator(
-        encoder=model.encoder,
-        it_module=model.it_module,
-        decoder=decoder,
-        device=device
-    )
-    
-    # Evaluate
-    return evaluator.evaluate_from_file(data_path=data_path, max_samples=max_samples)
 
-
-# Example usage
-if __name__ == "__main__":
-    # Example evaluation without model loading
-    sample_responses = [
-        "I understand how you feel.",
-        "That sounds really difficult to deal with.", 
-        "I'm here to listen if you need to talk.",
-        "Have you considered talking to someone about this?",
-        "Your feelings are completely valid."
-    ]
-    
-    # Compute only distinct-n metrics (no model needed)
-    print("Computing distinct-n metrics for sample responses:")
-    d1 = DistinctNCalculator.compute_distinct_n(sample_responses, n=1)
-    d2 = DistinctNCalculator.compute_distinct_n(sample_responses, n=2)
-    print(f"Distinct-1: {d1:.3f}")
-    print(f"Distinct-2: {d2:.3f}")
-    
-    # For full evaluation with perplexity, use:
-    results = load_model_and_evaluate("path/to/model.pt", max_samples=100)
-    print_informativeness_results(results)

@@ -1,0 +1,46 @@
+{
+  "run": {
+    "seed": 42,
+    "num_epochs": 1000,
+    "device": "auto",
+    "log_dir": "logs/tensorboard"
+  },
+  "data": {
+    "ec_data_path": "dataset/emotion_labels_user_response.pkl",
+    "batch_size": 4,
+    "max_input_length": 64
+  },
+  "loss_weights": { "delta": 1.0, "zeta": 1.0, "eta": 1.0 },
+  "optimizer": {
+    "lr": 1e-4,
+    "weight_decay": 1e-5,
+    "scheduler": { "type": "linear", "warmup_ratio": 0.06, "warmup_steps": 0 }
+  },
+  "model": {
+    "model_dim": 128,
+    "coverage_weight": 0.0,
+    "encoder": {"layers": 2, "heads": 4, "ff_dim": 256, "dropout": 0.1, "attention_dropout": 0.1},
+    "decoder": {"nhead": 4, "ff_dim": 256, "dropout": 0.1, "max_resp_len": 16},
+    "intent_twice": {"emotion_dim": 32, "intent_vocab_size": 9, "diffusion_steps": 10, "beta_start": 1e-4, "beta_end": 5e-2, "tau": 1.0},
+    "emu": {"use_cross_attn": false, "n_heads": 4},
+    "era": {"enabled": false}
+  },
+  "evaluation": {
+    "enabled": true,
+    "every_epochs": 1,
+    "every_steps": null,
+    "max_eval_samples": 100,
+    "generation": {"max_len": 32, "temperature": 1.0, "top_k": 0, "top_p": 1.0, "use_pointer": false},
+    "metrics": {"bleu": true, "bart_score": true, "informativeness": true},
+    "examples": {"log": true, "num": 5},
+    "results_dir": "output"
+  },
+  "early_stopping": {
+    "enabled": false,
+    "patience": 3,
+    "min_delta": 0.001,
+    "mode": "auto",
+    "loss_weight": 0.7,
+    "bleu1_weight": 0.3
+  }
+}

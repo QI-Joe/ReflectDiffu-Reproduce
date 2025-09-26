@@ -143,15 +143,38 @@ class EMU(nn.Module):
         cvae_pos = self.pos_cvae
         cvae_neg = self.neg_cvae
 
-        # 反向一步（教学版：单步近似；你可以循环多步）
-        Qprev_pos, (mu_pos, logvar_pos) = self.p_sample_step(cvae_pos, Qt, t, intentfirst)
-        Qprev_neg, (mu_neg, logvar_neg) = self.p_sample_step(cvae_neg, Qt, t, intentfirst)
+        # === Plan A: 简单循环多步近似 ===
+        # 思路：重复使用同一随机 t，对 Qt 迭代多次 p_sample_step；
+        # 这是最小侵入式改造，不追求严格的时间序列递减，仅做多次残差精炼。
+        n_steps = B
+        Qpos_cur = Qt
+        Qneg_cur = Qt
+        kld_pos_list = []
+        kld_neg_list = []
+        mu_pos = logvar_pos = mu_neg = logvar_neg = None  # 占位便于后续引用最后一步
 
-        # KL (CVAE标准KL) 只对对应极性聚合
-        kld_pos = -0.5 * torch.sum(1 + logvar_pos - mu_pos.pow(2) - logvar_pos.exp(), dim=-1)  # [B]
-        kld_neg = -0.5 * torch.sum(1 + logvar_neg - mu_neg.pow(2) - logvar_neg.exp(), dim=-1)  # [B]
+        for i in range(n_steps):
+            Qpos_cur, (mu_pos, logvar_pos) = self.p_sample_step(cvae_pos, Qpos_cur, t, intentfirst)
+            Qneg_cur, (mu_neg, logvar_neg) = self.p_sample_step(cvae_neg, Qneg_cur, t, intentfirst)
+            # 逐步 KL
+            kld_pos_step = -0.5 * torch.sum(1 + logvar_pos - mu_pos.pow(2) - logvar_pos.exp(), dim=-1)  # [B]
+            kld_neg_step = -0.5 * torch.sum(1 + logvar_neg - mu_neg.pow(2) - logvar_neg.exp(), dim=-1)  # [B]
+            kld_pos_list.append(kld_pos_step)
+            kld_neg_list.append(kld_neg_step)
 
-        # 构造 Emopos / Emoneg：把不属于该极性的样本替换为原Q，避免错误传导（教学技巧）
+        # 聚合 KL：均值保持尺度与单步接近（兼容原 loss 权重）
+        if len(kld_pos_list) == 1:
+            kld_pos = kld_pos_list[0]
+            kld_neg = kld_neg_list[0]
+        else:
+            kld_pos = torch.stack(kld_pos_list, dim=0).mean(0)  # [B]
+            kld_neg = torch.stack(kld_neg_list, dim=0).mean(0)
+
+        # 使用最后一次迭代得到的 Qpos_cur / Qneg_cur 作为精炼结果
+        Qprev_pos = Qpos_cur
+        Qprev_neg = Qneg_cur
+
+        # 构造 Emopos / Emoneg：保持原有 mask 回退逻辑（未选中极性仍用原 Q）
         Emopos = torch.where(is_pos_mask.unsqueeze(-1), Qprev_pos, Q)  # [B, D]
         Emoneg = torch.where(~is_pos_mask.unsqueeze(-1), Qprev_neg, Q) # [B, D]
 

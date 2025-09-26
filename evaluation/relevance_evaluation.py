@@ -8,14 +8,13 @@ import time
 import os
 from pathlib import Path
 import pickle
-from src.emotion_contagion.data_processor import EmotionContagionDataProcessor
-from portable_inference import build_random_intent
 from src.emotion_contagion.encoder import EmotionContagionEncoder
 from src.intent_twice.intent_twice_integration import IntentTwiceModule
 from src.intent_twice.EMU import EMUConfig, EMU
 from src.intent_twice.response_decoder import PaperCompliantDecoderWithLoss
 from src.tokenizer_loader import get_tokenizer
 from evaluation.informativeness import InformativenessEvaluator
+from evaluation.utils import prepare_evaluation_data, EvaluationSample
 
 from sacrebleu.metrics import BLEU
 SACREBLEU_AVAILABLE = True
@@ -30,19 +29,6 @@ except ImportError:
     print("Warning: bart-score not available. Install with: pip install bart-score")
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class EvaluationSample:
-    """Single evaluation sample containing user input and target response for generation."""
-    user_tokens: List[str]  # User input tokens (unpadded, truncated to max_length)
-    user_input_ids: List[int]  # Tokenizer-encoded input ids (length = max_length)
-    user_label_ids: List[int]  # User input emotion labels (padded to max_length)
-    user_attention_mask: List[int]  # Attention mask from tokenizer (length = max_length)
-    response_tokens: List[str]  # Target response tokens (raw tokens, no manual padding)
-    response_input_ids: Optional[List[int]] = None  # Tokenizer ids for reference response (no extra special tokens, truncated)
-    h_tilde: Optional[torch.Tensor] = None
-    p_intent: Optional[List[float]] = None
 
 
 @dataclass
@@ -320,6 +306,8 @@ class InferenceEngine:
                     max_length=len(hyp_ids) + 5  # heuristic buffer
                 )["input_ids"]
             ref_text = TOKENIZER.decode(ref_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+            
+            print(f"user input: {' '.join(sample.user_tokens)} \nmodel output: {hyp_text}\nreference: {ref_text}\n")
 
             hyps.append(hyp_text)
             refs.append(ref_text)
@@ -452,113 +440,8 @@ class ReflectDiffuEvaluator:
         self.bos_id = TOKENIZER.cls_token_id 
         self.eos_id = TOKENIZER.sep_token_id
     
-    def prepare_evaluation_data(self, raw_data: List = None, batch_size: int = None, 
-                               test_data_path: str = "dataset/emotion_labels_test.pkl") -> List[EvaluationSample]:
-        """
-        Prepare evaluation data from conversational format.
-            
-        Returns:
-            List of EvaluationSample objects
-        """
-        # Process data in pairs: user=even indices, response=odd indices
-        eval_samples = []
-        dp = EmotionContagionDataProcessor(max_length=64)
-        raw_data = dp.load_data(test_data_path)
-        # self.batch_data = dp.process_batch(raw_data, ifeval=True)
-        
-        
-        # Load intent predictions
-        model_path = os.path.join(os.path.dirname(__file__), 'pre-trained', 'model', 'model')
-        # self.agent = build_agent(model_path)
-        
-        intent_idx = 0
-        
-        # Process conversations: each conversation is a list of (token, label) tuples
-        # We expect alternating user-response pairs within each conversation
-        for conv_idx, conv in enumerate(raw_data):
-            if not isinstance(conv, (list, tuple)) or len(conv) != 2:
-                continue  # Skip malformed entries
-            user_list, response_list = conv
-            min_len = min(len(user_list), len(response_list))
-
-            for i in range(min_len):
-                user_item = user_list[i]
-                response_item = response_list[i]
-
-                if not user_item or not response_item:
-                    continue
-
-                # Each item is a list of (token, label) tuples
-                try:
-                    user_tokens_raw, user_labels_raw = zip(*user_item)
-                    response_tokens_raw, _ = zip(*response_item)
-                except ValueError:
-                    # Skip if structure unexpected
-                    continue
-
-                user_tokens = list(user_tokens_raw)
-                response_tokens = list(response_tokens_raw)
-                user_label_ids = [1 if l == '<em>' else 0 for l in user_labels_raw]
-
-                if not user_tokens or not response_tokens:
-                    continue
-
-                max_len = dp.max_length
-                # Truncate tokens & labels together
-                if len(user_tokens) > max_len:
-                    user_tokens = user_tokens[:max_len]
-                    user_label_ids = user_label_ids[:max_len]
-
-                # Encode with tokenizer (let tokenizer handle padding to max_length)
-                user_text = " ".join(user_tokens)
-                encoded = TOKENIZER(
-                    user_text,
-                    padding='max_length',
-                    truncation=True,
-                    max_length=max_len,
-                    return_tensors='pt'
-                )
-                user_input_ids = encoded['input_ids'][0].tolist()
-                user_attention_mask = encoded['attention_mask'][0].tolist()
-
-                # Pad emotion labels to max_len (independent of wordpiece expansion)
-                if len(user_label_ids) < max_len:
-                    user_label_ids = user_label_ids + [0] * (max_len - len(user_label_ids))
-                else:
-                    user_label_ids = user_label_ids[:max_len]
-
-                # Intent prediction (random placeholder)
-                p_intent = build_random_intent([user_text], self.device)
-                intent_idx += 1
-
-                # Encode reference response for consistent decoding metrics (avoid adding BOS/EOS twice)
-                response_text = " ".join(response_tokens)
-                # We don't force max_length padding for reference; just truncate to max_len to be comparable
-                resp_encoded = TOKENIZER(
-                    response_text,
-                    padding=False,
-                    truncation=True,
-                    max_length=max_len,
-                    add_special_tokens=False,
-                    return_tensors='pt'
-                )
-                response_input_ids = resp_encoded['input_ids'][0].tolist()
-
-                eval_samples.append(
-                    EvaluationSample(
-                        user_tokens=user_tokens,  # original (possibly truncated) tokens
-                        user_input_ids=user_input_ids,
-                        user_label_ids=user_label_ids,
-                        user_attention_mask=user_attention_mask,
-                        response_tokens=response_tokens,
-                        response_input_ids=response_input_ids,
-                        h_tilde=None,
-                        p_intent=p_intent
-                    )
-                )
-        
-        logger.info(f"Prepared {len(eval_samples)} evaluation samples")
-        return eval_samples
+    def prepare_evaluation_data(self):
+        return prepare_evaluation_data()
     
     def evaluate(
         self,
@@ -624,21 +507,6 @@ class ReflectDiffuEvaluator:
         
         logger.info(f"Evaluation completed in {generation_time:.2f}s")
         return results
-    
-    def evaluate_from_raw_data(
-        self,
-        raw_data: List,
-        max_samples: int = None,
-        **evaluation_kwargs
-    ) -> EvaluationResults:
-        """
-        Convenience method to evaluate directly from raw data.
-            
-        Returns:
-            EvaluationResults object
-        """
-        eval_samples = self.prepare_evaluation_data(raw_data, batch_size=max_samples)
-        return self.evaluate(eval_samples, **evaluation_kwargs)
     
     def save_results(self, results: EvaluationResults, output_path: str, hyps: List[str] = None, refs: List[str] = None):
         """
@@ -784,6 +652,9 @@ class TrainingEvaluator:
         
         logger.info(f"TrainingEvaluator initialized with config: {config}")
     
+    def prepare_evaluation_data(self):
+        return prepare_evaluation_data()
+    
     def initialize(self):
         """Initialize the evaluator and prepare evaluation data."""
         self.evaluator = ReflectDiffuEvaluator(
@@ -801,10 +672,7 @@ class TrainingEvaluator:
             device=self.model.device
         )
         
-        self.eval_data = self.evaluator.prepare_evaluation_data(
-            raw_data=None,  # Let evaluator load from test file 
-            batch_size=self.config.max_eval_samples
-        )
+        self.eval_data = self.prepare_evaluation_data()
         self.num_eval_samples = len(self.eval_data)
         
         logger.info(f"Evaluation initialized with {self.num_eval_samples} samples")
@@ -854,7 +722,7 @@ class TrainingEvaluator:
         info_results = None
         if self.config.compute_informativeness:
             info_results = self.evaluator_inform.evaluate_from_file(
-                data_path=self.config.eval_data_path or 'dataset/emotion_labels_test.pkl',
+                data_path=self.config.eval_data_path,
                 max_samples=self.config.max_eval_samples
             )
             self.last_informativeness = info_results
@@ -905,11 +773,12 @@ class TrainingEvaluator:
                     top_p=self.config.top_p
                 )
                 
-                for i, (hyp, ref) in enumerate(zip(hyps, refs)):
-                    print(f"  Example {i+1}:")
-                    print(f"    Generated: {hyp}")
-                    print(f"    Reference: {ref}")
-                    print()
+                for idx, (h, r) in enumerate(zip(hyps, refs)):
+                    print(f"user input is: {' '.join(self.eval_data[idx].user_tokens)}")
+                    print(f"hypothesis is: {h}")
+                    print(f"reference is: {r}")
+                    print("-" * 20)
+                    if idx == 20: break
                     
             except Exception as e:
                 logger.warning(f"Failed to generate examples: {e}")

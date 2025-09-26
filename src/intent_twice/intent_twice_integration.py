@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple, Any
 import logging
+from src.intent_twice.EMU import EMU
 
 logger = logging.getLogger(__name__)
 
@@ -202,7 +203,7 @@ class IntentTwiceModule(nn.Module):
         encoder_out: Dict[str, torch.Tensor],
         intent_out: Dict[str, torch.Tensor],
         return_components: bool = False,
-        emu_module: Optional[nn.Module] = None,
+        emu_module: EMU = None,
         intent_policy_module: Optional[nn.Module] = None,
     ) -> Dict[str, torch.Tensor]:
         """
@@ -246,7 +247,7 @@ class IntentTwiceModule(nn.Module):
         if emu is None:
             raise ValueError("emu_module must be provided either in __init__ or forward")
 
-        Emofused, emu_stats = emu(
+        Emofused, emu_stats = emu.forward(
             Q=Q,
             intentfirst=intent_first,
             is_pos_mask=is_pos_mask,
