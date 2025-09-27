@@ -3,7 +3,15 @@ import numpy as np
 from typing import Optional, Dict, Any
 import logging
 import os
+from datetime import datetime
+
+# Local time
+GLOBAL_TIME = datetime.now().strftime("%m-%d-%H-%M")
 logger = logging.getLogger(__name__)
+
+from src.intent_twice.intent_emotion_capture import get_batch_integrator
+BATCH_INTEGRATOR = get_batch_integrator()
+
 
 
 class EarlyStopping:
@@ -129,7 +137,7 @@ class EarlyStopping:
                 store_path = r"output/best_model/"
                 if os.path.exists(store_path) is False:
                     os.makedirs(store_path)
-                torch.save(model, os.path.join(store_path, f'best_model_{self.best_bleu1*100:.2f}.pt'))
+                torch.save(model, os.path.join(store_path, f'best_model_{GLOBAL_TIME}_{self.best_bleu1:.2f}.pt'))
             
             if self.verbose:
                 print(f"✅ Epoch {epoch}: Improvement detected!")

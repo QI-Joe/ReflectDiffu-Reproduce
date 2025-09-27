@@ -173,10 +173,7 @@ class TrainingEvaluator:
             logger.info("Using training data for evaluation")
         
         # 准备评估样本
-        self.eval_data = self.evaluator.prepare_evaluation_data(
-            eval_raw_data, 
-            batch_size=self.config.max_eval_samples
-        )
+        self.eval_data = self.evaluator.prepare_evaluation_data()
         
         logger.info(f"Prepared {len(self.eval_data)} evaluation samples")
             

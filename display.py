@@ -67,11 +67,7 @@ def evaluate_relevance(model, data_path: str, max_samples: int, device: torch.de
     )
     
     # Prepare evaluation data
-    eval_samples = relevance_evaluator.prepare_evaluation_data(
-        raw_data=None,
-        batch_size=max_samples,
-        test_data_path=data_path
-    )
+    eval_samples = relevance_evaluator.prepare_evaluation_data()
     
     
     # Run evaluation
@@ -243,8 +239,8 @@ def save_eval_results(
 def main():
     """Main evaluation function."""
     parser = argparse.ArgumentParser(description="Evaluate ReflectDiffu model on relevance and informativeness metrics")
-    parser.add_argument("--model_path", type=str, default=r"output/best_model/best_model.pt", help="Path to saved model (.pt file)")
-    parser.add_argument("--data_path", type=str, default="dataset/emotion_labels_test.pkl", help="Path to test data")
+    parser.add_argument("--model_path", type=str, default=r"output/best_model/best_model_09-27-14-06_22.68.pt", help="Path to saved model (.pt file)")
+    parser.add_argument("--data_path", type=str, default="dataset/available_dataset/test.pkl", help="Path to test data")
     parser.add_argument("--max_samples", type=int, default=100, help="Maximum number of samples to evaluate")
     parser.add_argument("--quiet", action="store_true", default=True, help="Reduce logging output")
     

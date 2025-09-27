@@ -11,19 +11,15 @@ sys.path.insert(0, pre_trained_path)
 # Also add the pre-trained directory to ensure intent_prediction can be found
 sys.path.insert(0, os.path.join(pre_trained_path))
 
-# from parlai.core.params import ParlaiParser
-# from parlai.core.agents import create_agent
+from parlai.core.params import ParlaiParser
+from parlai.core.agents import create_agent
+from src.tokenizer_loader import get_tokenizer
 
 warnings.filterwarnings('ignore')
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-
-class ParlaiParser:
-    def __init__(self):
-        pass
-    
-def create_agent(opt):
-    pass
-
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+TOKENIZER = get_tokenizer()
+AGNET = None
 
 def build_agent(model_path):
     """Build and load the EmpHi agent with portable paths"""
@@ -47,6 +43,13 @@ def build_agent(model_path):
     agent = create_agent(opt)
     agent.model.eval()
     return agent
+
+def get_agent():
+    global AGNET
+    if AGNET is None:
+        model_path = os.path.join(os.path.dirname(__file__), 'pre-trained', 'model', 'model')
+        AGNET = build_agent(model_path)
+    return AGNET
 
 @torch.no_grad()
 def get_intent_distribution(agent, text_list):

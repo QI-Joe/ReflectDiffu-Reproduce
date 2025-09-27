@@ -22,6 +22,7 @@ from sklearn.model_selection import train_test_split
 from openai import OpenAI
 import re
 import string
+from dotenv import load_dotenv
 
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -30,6 +31,9 @@ from transformers import AutoTokenizer, AutoModel
 logger = logging.getLogger(__name__)
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 EDGE_PUNCT = string.punctuation
+load_dotenv()
+GROK3_API = os.getenv('GROK3_API')
+GROK_URL = os.getenv('GROK_URL')
 
 @dataclass
 class DialogueSample:
@@ -115,8 +119,6 @@ class EmpathyDataProcessor:
     
     def _load_API_data(self):
         """Load API LLM model for data annotation."""
-        GROK3_API = ''
-        GROK_URL = "https://api.x.ai/v1"
         return GROK3_API, GROK_URL
 
     def _call_API_LLM_model(self, given_prompt: str):
@@ -170,7 +172,7 @@ class EmpathyDataProcessor:
         self.llm_tokenizer = llm_tokenizer
     
     def pattern_parser(self, df: pd.DataFrame, if_api: bool, task, threshold):
-        dialogues, counter, prev = [], 1100, 1100
+        dialogues, counter, prev = [], 400, 400
         
         for conv_id, group in df.groupby('conv_id'):
             group_length = len(group)

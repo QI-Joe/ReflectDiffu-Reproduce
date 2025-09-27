@@ -12,9 +12,10 @@ import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple, Any
 import logging
 from src.intent_twice.EMU import EMU
+from src.intent_twice.intent_emotion_capture import get_batch_integrator
 
 logger = logging.getLogger(__name__)
-
+BATCH_INTEGRATOR = get_batch_integrator()
 
 class IntentTwiceConfig:
     """Configuration for Intent Twice integration."""
@@ -77,7 +78,7 @@ class EmotionMappings:
         1: ["excited", "confident", "joyful", "grateful", "content", "caring"],
 
         # G2: angry, disappointed
-        2: ["angry", "disappointed"],
+        2: ["disgusted", "furious", "devastated", "angry", "disappointed", "annoyed", "ashamed"],
 
         # G3: hopeful, sentimental
         3: ["hopeful", "sentimental"],
@@ -90,11 +91,11 @@ class EmotionMappings:
 
     # 每组的 Top-3 Intentrefer（把名称映射为 id）
     REFER_BY_GROUP_NAMES = {
-        0: ["acknowledging", "encouraging", "neutral"],
+        0: ["acknowledging", "encouraging", "questioning"],
         1: ["encouraging", "sympathizing", "acknowledging"],
         2: ["consoling", "suggesting", "encouraging"],
         3: ["encouraging", "wishing", "consoling"],
-        4: ["consoling", "encouraging", "neutral"],
+        4: ["agreeing", "encouraging", "neutral"],
     }
     # NOTE: Can't compute REFER_BY_GROUP here using a comprehension because
     # comprehensions within class scope don't see class-level names in Python 3.
@@ -126,6 +127,12 @@ class EmotionMappings:
     @classmethod
     def is_positive(cls, emotion_id: int) -> bool:
         return cls.emotion_name(emotion_id) in cls.POSITIVE
+    
+    @classmethod
+    def get_emotion_group_id(cls, emotion_name: str):
+        for grd, members in cls.GROUPS.items():
+            if emotion_name in members:
+                return grd
 
 # Post-class initialization that depends on class attributes
 EmotionMappings.REFER_BY_GROUP = {
@@ -234,6 +241,7 @@ class IntentTwiceModule(nn.Module):
         p_semantic = encoder_out["P_semantic"].to(device)  # [B, intent_dim]
         p_intent = intent_out["p_intent"]
         p = p_semantic + self.config.alpha * p_intent  # [B, intent_dim == 9]
+        BATCH_INTEGRATOR.add("final_p", p.detach().cpu().tolist())
         
         # ==================== Step 2: Compute Masks and Groups ====================
         group_ids, is_pos_mask = self.compute_masks_and_groups(p)

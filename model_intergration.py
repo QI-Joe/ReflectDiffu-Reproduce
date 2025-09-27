@@ -9,16 +9,18 @@ from src.emotion_contagion.data_processor import EmotionContagionDataProcessor
 from src.emotion_contagion.config import EmotionContagionConfig
 from src.emotion_contagion.encoder import EmotionContagionEncoder, EmotionClassifier, ce_loss_for_emotion
 from src.emotion_contagion.foundation_emb import IntentSemanticScorer
-from src.intent_twice.intent_twice_integration import IntentTwiceConfig, IntentTwiceModule
+from src.intent_twice.intent_twice_integration import IntentTwiceConfig, IntentTwiceModule, EmotionMappings
 from src.intent_twice.EMU import EMUConfig, EMU
 from src.intent_twice.IntentPolicy import IntentPolicy
 
 from src.intent_twice.response_decoder import create_paper_compliant_decoder
-from portable_inference import build_random_intent
+from portable_inference import build_random_intent, get_agent, get_intent_distribution
+from src.intent_twice.intent_emotion_capture import get_batch_integrator
 
 # Inline tokenizer loader (avoids import path issues during refactor)
 from src.tokenizer_loader import get_tokenizer
 TOKENIZER = get_tokenizer()
+BATCH_INTEGRATOR = get_batch_integrator()
 
 def build_emotion_contagion_encoder(vocab_size: int = 5000, model_dim: int = 128, enc_cfg: Dict[str, Any] | None = None):
     """构建情感传染编码器 (now parameterized by unified config)."""
@@ -130,8 +132,7 @@ class ReflectDiffu(nn.Module):
         self.raw_data = self.dp.load_data(data_path)
         
         # Process all data first (tokenizer provides fixed vocab)
-        model_path = os.path.join(os.path.dirname(__file__), 'pre-trained', 'model', 'model')
-        # self.agent = build_agent(model_path)
+        self.agent = get_agent()
 
         # Fixed tokenizer vocab size placeholder (not used but kept for compatibility)
         self.vocab_tokens = None
@@ -139,10 +140,11 @@ class ReflectDiffu(nn.Module):
         # Create batches
         self.batches = []
         total_samples = len(self.raw_data)
-        for i in range(0, total_samples):
-            single_conv = self.raw_data[i]
-            batch_user, batch_response = self.dp.process_batch(single_conv)
-            batch_p_intent = build_random_intent(batch_user, self.device)
+        for i in range(0, total_samples, self.batch_size):
+            end_idx = min(i+self.batch_size, total_samples)
+            convs = self.raw_data[i:end_idx]
+            batch_user, batch_response = self.dp.process_batch(convs)
+            batch_p_intent = get_intent_distribution(self.agent, batch_user)
             
             self.batches.append({
                 'user': batch_user,
@@ -212,6 +214,7 @@ class ReflectDiffu(nn.Module):
         input_ids = torch.tensor([u['input_ids'] for u in user_data], dtype=torch.long, device=self.device)
         attention_mask = torch.tensor([u['attention_mask'] for u in user_data], dtype=torch.long, device=self.device)
         label_ids = torch.tensor([u['label_ids'] for u in user_data], dtype=torch.long, device=self.device)
+        emotion_id = torch.tensor([EmotionMappings.EMOTIONS.index(u['matched_emotion']) for u in user_data], dtype=torch.long, device=self.device)
         
         # Prepare decoder inputs from response data
         decoder_data = self._prepare_decoder_data(response_data, user_data)
@@ -222,6 +225,7 @@ class ReflectDiffu(nn.Module):
             'attention_mask': attention_mask,
             'h_tilde': None,  # ERA placeholder
             'p_intent': p_intent_data,
+            'emotion_id': emotion_id,
             **decoder_data
         }
         
@@ -286,6 +290,7 @@ class ReflectDiffu(nn.Module):
         attention_mask = prepared_data['attention_mask']
         h_tilde = prepared_data['h_tilde']
         p_intent = prepared_data['p_intent']
+        emotion_id = prepared_data['emotion_id']
         
         # 1. Emotion Contagion Encoder
         enc_out = self.encoder.forward(
@@ -297,15 +302,19 @@ class ReflectDiffu(nn.Module):
         H, Q, P = enc_out['H'], enc_out['Q'], enc_out['P']
         
         # Emotion classification and loss
-        emotion_labels = P.argmax(dim=-1)
-        ntx_loss = self.encoder.loss(Q, emotion_labels)
-        emo_logits = self.emotion_cls.forward(Q)
-        Lce_loss = ce_loss_for_emotion(emo_logits, emotion_labels)
+        emotion_labels = emotion_id
+        ntx_loss = self.encoder.loss(P, emotion_labels)
+        # emo_logits = self.emotion_cls.forward(Q)
+        Lce_loss = ce_loss_for_emotion(P, emotion_labels)
         Lem = ntx_loss + Lce_loss
         
         # 2. Intent Twice Integration
-        P_semantic, _ = self.semantic_scorer(Q)
+        P_semantic, _ = self.semantic_scorer.forward(Q)
         enc_out["P_semantic"] = P_semantic
+        
+        BATCH_INTEGRATOR.add("input_data", batch_data)
+        BATCH_INTEGRATOR.add("emotion_p", P.clone().detach().cpu().tolist())
+        BATCH_INTEGRATOR.add("intent_p", P_semantic.clone().detach().cpu().tolist())
         
         it_out = self.it_module.forward(
             encoder_out=enc_out, 

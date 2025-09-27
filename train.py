@@ -11,10 +11,12 @@ from early_stopping import EarlyStopping, create_early_stopping
 from torch.utils.tensorboard import SummaryWriter
 from lr_scheduler import create_scheduler
 from config_loader import load_config, save_effective, as_dotdict
+from src.intent_twice.intent_emotion_capture import get_batch_integrator
 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+BATCH_INTEGRATOR = get_batch_integrator()
 
 def create_optimizer(model: ReflectDiffu, lr: float = 1e-4, weight_decay: float = 1e-5):
     """Create optimizer for the ReflectDiffu model."""
@@ -64,7 +66,7 @@ def train_step(model: ReflectDiffu, optimizer, batch_data, delta=1.0, zeta=1.0, 
     return results
 
 
-def train_epoch(model: ReflectDiffu, optimizer, batches, scheduler, num_epochs: int = 1, 
+def train_epoch(model: ReflectDiffu, optimizer, batches, scheduler, num_epochs, 
                 delta=1.0, zeta=1.0, eta=1.0, verbose=True, writer: SummaryWriter=None, start_step:int=0,):
     """
     Train for one epoch using multiple batches.
@@ -85,7 +87,7 @@ def train_epoch(model: ReflectDiffu, optimizer, batches, scheduler, num_epochs: 
     
     total_steps = len(batches) * num_epochs
     if verbose:
-        print(f"\\n=== Training Epoch ({len(batches)} batches × {num_epochs} epochs = {total_steps} steps) ===")
+        print(f"\\n=== Training Epoch ({len(batches)} batches in {num_epochs}th epochs ===")
     
     step = 0
     for batch_idx, batch_data in enumerate(batches):
@@ -94,7 +96,7 @@ def train_epoch(model: ReflectDiffu, optimizer, batches, scheduler, num_epochs: 
             batch_data["user"], batch_data["response"] = batch_data["user"][:lens], batch_data["response"][:lens]
             batch_data["p_intent"] = batch_data["p_intent"][:lens]
             
-            
+        BATCH_INTEGRATOR.get_batch_epoch(batch_idx, num_epochs, eval_per_epoch=20, total_batches=len(batches))
         step_losses = train_step(model, optimizer, batch_data, delta, zeta, eta, verbose=False)
         epoch_losses.append(step_losses)
         
@@ -111,8 +113,11 @@ def train_epoch(model: ReflectDiffu, optimizer, batches, scheduler, num_epochs: 
         scheduler.step()
         step += 1
         
-        if verbose and (step % max(1, total_steps // 10) == 0):
+        if verbose and (step % max(1, total_steps // 10) == 0) and total_steps!=0:
             print(f"Step {step}/{total_steps} (Batch {batch_idx+1}): Joint Loss = {step_losses['joint_loss']:.4f}")
+            
+    if BATCH_INTEGRATOR.need_store(num_epochs):
+            BATCH_INTEGRATOR.store()
     
     # Compute average losses
     avg_losses = {
@@ -206,7 +211,6 @@ def train_with_evaluation(args, eval_config: Optional[EvaluationConfig] = None, 
     
     # 3. 训练循环 (修改为使用batches)
     print("\\n🚀 Starting Training with Evaluation...")
-    num_epochs = num_epochs  # already resolved above
     total_steps = 0
     
     writer = SummaryWriter(log_dir=os.path.join('logs', 'tensorboard'))
@@ -222,7 +226,7 @@ def train_with_evaluation(args, eval_config: Optional[EvaluationConfig] = None, 
             optimizer=optimizer,
             batches=batches,
             scheduler=scheduler,
-            num_epochs=1,
+            num_epochs=epoch,
             delta=(args.delta if not unified_cfg else unified_cfg['loss_weights']['delta']),
             zeta=(args.zeta if not unified_cfg else unified_cfg['loss_weights']['zeta']),
             eta=(args.eta if not unified_cfg else unified_cfg['loss_weights']['eta']),
@@ -234,8 +238,8 @@ def train_with_evaluation(args, eval_config: Optional[EvaluationConfig] = None, 
         global_step += len(batches)
         current_loss = epoch_losses[-1]['joint_loss']
         print(f"[Reflect-Diffu] | Completed Epoch {epoch + 1}. For loss {epoch_losses[-1]['joint_loss']:.4f}, total steps {total_steps}.")
+        # BATCH_INTEGRATOR.store()
         
-        eval_results = None
         if training_evaluator and training_evaluator.should_evaluate(epoch + 1, total_steps):
             print("\\n🔍 Running evaluation...")
             model.eval()
@@ -268,6 +272,7 @@ def train_with_evaluation(args, eval_config: Optional[EvaluationConfig] = None, 
                 print(f"  Best loss: {summary['best_loss']:.4f} at epoch {summary['best_epoch']}")
                 print(f"  Best BLEU-1: {summary['best_bleu1']:.2f}%")
                 print(f"  Training stopped after {summary['total_epochs']} epochs")
+                BATCH_INTEGRATOR.store()
                 break
     
     # 4. 最终评估
@@ -324,7 +329,7 @@ def main():
     ap.add_argument('--config', type=str, default=None, help='Path to unified JSON config (overrides most CLI args)')
     
     # Original training arguments
-    ap.add_argument('--ec_data', type=str, default=r"dataset/emotion_labels_user_response.pkl", 
+    ap.add_argument('--ec_data', type=str, default=r"dataset/available_dataset/train.pkl", 
                    help='Path to emotion contagion pickle file or directory')
     ap.add_argument('--batch_size', type=int, default=4)
     ap.add_argument('--cuda', action='store_true', default=True)
@@ -336,19 +341,19 @@ def main():
     # Optimization hyperparameters
     ap.add_argument('--lr', type=float, default=1e-4, help='Base learning rate')
     ap.add_argument('--weight_decay', type=float, default=1e-5, help='Weight decay for AdamW')
-    ap.add_argument('--num_epochs', type=int, default=1000, help='Total training epochs')
-    ap.add_argument('--lr_scheduler', type=str, default='none', choices=['none','linear','cosine'], help='Learning rate schedule type')
+    ap.add_argument('--num_epochs', type=int, default=160, help='Total training epochs')
+    ap.add_argument('--lr_scheduler', type=str, default='linear', choices=['none','linear','cosine'], help='Learning rate schedule type')
     ap.add_argument('--warmup_steps', type=int, default=0, help='Number of warmup steps (if >0 overrides warmup_ratio)')
     ap.add_argument('--warmup_ratio', type=float, default=0.06, help='Warmup ratio (fraction of total steps) if warmup_steps==0')
     
     # Evaluation configuration arguments
     ap.add_argument('--enable_eval', action='store_true', default=True,
                    help='Enable evaluation during training')
-    ap.add_argument('--eval_every_epochs', type=int, default=1,
+    ap.add_argument('--eval_every_epochs', type=int, default=20,
                    help='Evaluate every N epochs')
     ap.add_argument('--eval_every_steps', type=int, default=None,
                    help='Evaluate every N steps (overrides eval_every_epochs)')
-    ap.add_argument('--eval_data_path', type=str, default="dataset/emotion_labels_test.pkl",
+    ap.add_argument('--eval_data_path', type=str, default=r"dataset/available_dataset/test.pkl",
                    help='Path to evaluation data (uses training data if not specified)')
     ap.add_argument('--max_eval_samples', type=int, default=100,
                    help='Maximum number of evaluation samples')
@@ -364,7 +369,7 @@ def main():
                    help='Directory to save evaluation results')
     ap.add_argument('--eval_log_examples', action='store_true', default=True,
                    help='Log generation examples during evaluation')
-    ap.add_argument('--eval_num_examples', type=int, default=5,
+    ap.add_argument('--eval_num_examples', type=int, default=10,
                    help='Number of examples to log')
     
     # Early Stopping arguments
